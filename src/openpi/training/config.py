@@ -426,6 +426,12 @@ class RLDSDroidDataConfig(DataConfigFactory):
 
 @dataclasses.dataclass(frozen=True)
 class LeRobotYamDataConfig(DataConfigFactory):  # noqa: F821  (DataConfigFactory defined in config.py)
+    # YAM stores ABSOLUTE actions, so convert the arm-joint dims to deltas
+    # (relative to current state); grippers stay absolute. This matches how pi0 is
+    # trained and mirrors ALOHA's `use_delta_joint_actions`. Set False only if your
+    # dataset already stores delta actions (like LIBERO).
+    use_delta_joint_actions: bool = True
+
     @override
     def create(self, assets_dirs, model_config):
         # Rename raw LeRobot dataset keys -> intermediate keys used by YamInputs.
@@ -449,15 +455,19 @@ class LeRobotYamDataConfig(DataConfigFactory):  # noqa: F821  (DataConfigFactory
             outputs=[yam_policy.YamOutputs()],
         )
 
-        # NOTE on delta actions: LIBERO converts arm dims to deltas and keeps the
-        # gripper absolute. Whether that's right for YAM depends on your action
-        # space. Start WITHOUT it (below). If your actions are EE/joint deltas and
-        # training is unstable, add a bimanual mask (6 arm + 1 gripper, twice):
-        #   mask = _transforms.make_bool_mask(6, -1, 6, -1)
-        #   data_transforms = data_transforms.push(
-        #       inputs=[_transforms.DeltaActions(mask)],
-        #       outputs=[_transforms.AbsoluteActions(mask)],
-        #   )
+        # ABSOLUTE -> DELTA conversion. YAM stores ABSOLUTE actions but pi0 trains
+        # on deltas, so subtract the current state from the arm-joint dims. The mask
+        # make_bool_mask(6, -1, 6, -1) = [6 joints -> delta, 1 gripper -> absolute]
+        # per arm (14 dims total), same as ALOHA. At inference AbsoluteActions adds
+        # the state back. ASSUMES the action/state layout is:
+        #   [arm0: 6 joints, arm0 gripper, arm1: 6 joints, arm1 gripper]
+        # If your ordering differs, change the mask accordingly.
+        if self.use_delta_joint_actions:
+            delta_action_mask = _transforms.make_bool_mask(6, -1, 6, -1)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
 
         model_transforms = ModelTransformFactory()(model_config)  # noqa: F821
 
@@ -641,10 +651,10 @@ _CONFIGS = [
         ),
         policy_metadata={"reset_pose": [0, -1.5, 1.5, 0, 0, 0]},
     ),
-    # ---- full fine-tune ----
+    # ---- full fine-tune (needs 80GB; NOT the recommended first run for YAM) ----
     TrainConfig(
         name="pi0_fast_yam",
-        model=pi0_fast.Pi0FASTConfig(action_dim=14, action_horizon=10, max_token_len=250),
+        model=pi0_fast.Pi0FASTConfig(action_dim=14, action_horizon=50, max_token_len=600),
         data=LeRobotYamDataConfig(
             repo_id="Kavin60606/yam_pi0fast_train",
             base_config=DataConfig(prompt_from_task=True),
@@ -654,11 +664,15 @@ _CONFIGS = [
         ),
         num_train_steps=30_000,
     ),
-    # ---- LoRA (low-memory) fine-tune ----
+    # ---- LoRA (low-memory) fine-tune -- RECOMMENDED for YAM ----
+    # Hyperparameters tuned for the YAM dataset (335k frames / 163 tasks, bimanual
+    # teleop, ~12 demos/task). GOTCHA: keep lr_schedule.decay_steps == num_train_steps
+    # so the cosine LR fully decays by the end -- openpi's decay_steps defaults to
+    # 30k independently of num_train_steps.
     TrainConfig(
         name="pi0_fast_yam_low_mem_finetune",
         model=pi0_fast.Pi0FASTConfig(
-            action_dim=14, action_horizon=10, max_token_len=250,
+            action_dim=14, action_horizon=50, max_token_len=600,
             paligemma_variant="gemma_2b_lora",
         ),
         data=LeRobotYamDataConfig(
@@ -668,9 +682,17 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader(
             "gs://openpi-assets/checkpoints/pi0_fast_base/params"
         ),
-        num_train_steps=30_000,
+        num_train_steps=11_000,  # ~2.1 epochs at batch 64 over 335k frames (sparse per-task data -> fewer epochs)
+        # LR scaled UP for the larger batch (sqrt rule: 2.5e-5 * sqrt(64/32) ~= 3.5e-5).
+        # decay_steps MUST equal num_train_steps so the cosine LR fully decays.
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000, peak_lr=3.5e-5, decay_steps=11_000, decay_lr=3.5e-6
+        ),
+        batch_size=64,           # 2x A100-80GB data-parallel -> 32 samples/GPU
+        num_workers=32,          # 3-camera video decode is the loader bottleneck; feed 2 GPUs at batch 64
+        save_interval=2_000,     # ~7 checkpoints over the run
         freeze_filter=pi0_fast.Pi0FASTConfig(
-            action_dim=14, action_horizon=10, max_token_len=250,
+            action_dim=14, action_horizon=50, max_token_len=600,
             paligemma_variant="gemma_2b_lora",
         ).get_freeze_filter(),
         ema_decay=None,
