@@ -476,6 +476,10 @@ class LeRobotYamDataConfig(DataConfigFactory):  # noqa: F821  (DataConfigFactory
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
+            # Our YAM dataset's action column is "action" (singular), like ALOHA.
+            # openpi defaults to "actions" (LIBERO's converted name) -> KeyError,
+            # so tell LeRobot the real column name for the temporal action chunk.
+            action_sequence_keys=("action",),
         )
 
 
