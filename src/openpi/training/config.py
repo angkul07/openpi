@@ -661,7 +661,7 @@ _CONFIGS = [
     # ---- full fine-tune (needs 80GB; NOT the recommended first run for YAM) ----
     TrainConfig(
         name="pi0_fast_yam",
-        model=pi0_fast.Pi0FASTConfig(action_dim=14, action_horizon=50, max_token_len=600),
+        model=pi0_fast.Pi0FASTConfig(action_dim=14, action_horizon=50, max_token_len=300),
         data=LeRobotYamDataConfig(
             repo_id="Kavin60606/yam_pi0fast_train",
             base_config=DataConfig(prompt_from_task=True),
@@ -679,7 +679,7 @@ _CONFIGS = [
     TrainConfig(
         name="pi0_fast_yam_low_mem_finetune",
         model=pi0_fast.Pi0FASTConfig(
-            action_dim=14, action_horizon=50, max_token_len=600,
+            action_dim=14, action_horizon=50, max_token_len=300,
             paligemma_variant="gemma_2b_lora",
         ),
         data=LeRobotYamDataConfig(
@@ -689,17 +689,17 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader(
             "gs://openpi-assets/checkpoints/pi0_fast_base/params"
         ),
-        num_train_steps=11_000,  # ~2.1 epochs at batch 64 over 335k frames (sparse per-task data -> fewer epochs)
+        num_train_steps=7_000,   # ~1.3 epochs at batch 64 over 335k frames (budget-fit; --resume for more)
         # LR scaled UP for the larger batch (sqrt rule: 2.5e-5 * sqrt(64/32) ~= 3.5e-5).
         # decay_steps MUST equal num_train_steps so the cosine LR fully decays.
         lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=1_000, peak_lr=3.5e-5, decay_steps=11_000, decay_lr=3.5e-6
+            warmup_steps=1_000, peak_lr=3.5e-5, decay_steps=7_000, decay_lr=3.5e-6
         ),
         batch_size=64,           # 2x A100-80GB data-parallel -> 32 samples/GPU
         num_workers=32,          # 3-camera video decode is the loader bottleneck; feed 2 GPUs at batch 64
         save_interval=2_000,     # ~7 checkpoints over the run
         freeze_filter=pi0_fast.Pi0FASTConfig(
-            action_dim=14, action_horizon=50, max_token_len=600,
+            action_dim=14, action_horizon=50, max_token_len=300,
             paligemma_variant="gemma_2b_lora",
         ).get_freeze_filter(),
         ema_decay=None,
