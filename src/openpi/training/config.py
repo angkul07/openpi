@@ -20,6 +20,7 @@ import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
+from openpi.policies import yam_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
@@ -424,6 +425,51 @@ class RLDSDroidDataConfig(DataConfigFactory):
 
 
 @dataclasses.dataclass(frozen=True)
+class LeRobotYamDataConfig(DataConfigFactory):  # noqa: F821  (DataConfigFactory defined in config.py)
+    @override
+    def create(self, assets_dirs, model_config):
+        # Rename raw LeRobot dataset keys -> intermediate keys used by YamInputs.
+        # LEFT = target key (what YamInputs reads), RIGHT = your dataset feature name.
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/top_image": "observation.images.top",
+                        "observation/left_wrist_image": "observation.images.left_wrist",
+                        "observation/right_wrist_image": "observation.images.right_wrist",
+                        "observation/state": "observation.state",
+                        "actions": "action",
+                    }
+                )
+            ]
+        )
+
+        data_transforms = _transforms.Group(
+            inputs=[yam_policy.YamInputs(model_type=model_config.model_type)],
+            outputs=[yam_policy.YamOutputs()],
+        )
+
+        # NOTE on delta actions: LIBERO converts arm dims to deltas and keeps the
+        # gripper absolute. Whether that's right for YAM depends on your action
+        # space. Start WITHOUT it (below). If your actions are EE/joint deltas and
+        # training is unstable, add a bimanual mask (6 arm + 1 gripper, twice):
+        #   mask = _transforms.make_bool_mask(6, -1, 6, -1)
+        #   data_transforms = data_transforms.push(
+        #       inputs=[_transforms.DeltaActions(mask)],
+        #       outputs=[_transforms.AbsoluteActions(mask)],
+        #   )
+
+        model_transforms = ModelTransformFactory()(model_config)  # noqa: F821
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
 class LeRobotDROIDDataConfig(DataConfigFactory):
     """
     Example data config for custom DROID dataset in LeRobot format.
@@ -594,6 +640,40 @@ _CONFIGS = [
             default_prompt="open the tupperware and put the food on the plate",
         ),
         policy_metadata={"reset_pose": [0, -1.5, 1.5, 0, 0, 0]},
+    ),
+    # ---- full fine-tune ----
+    TrainConfig(
+        name="pi0_fast_yam",
+        model=pi0_fast.Pi0FASTConfig(action_dim=14, action_horizon=10, max_token_len=250),
+        data=LeRobotYamDataConfig(
+            repo_id="Kavin60606/yam_pi0fast_val",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi0_fast_base/params"
+        ),
+        num_train_steps=30_000,
+    ),
+    # ---- LoRA (low-memory) fine-tune ----
+    TrainConfig(
+        name="pi0_fast_yam_low_mem_finetune",
+        model=pi0_fast.Pi0FASTConfig(
+            action_dim=14, action_horizon=10, max_token_len=250,
+            paligemma_variant="gemma_2b_lora",
+        ),
+        data=LeRobotYamDataConfig(
+            repo_id="Kavin60606/yam_pi0fast_val",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi0_fast_base/params"
+        ),
+        num_train_steps=30_000,
+        freeze_filter=pi0_fast.Pi0FASTConfig(
+            action_dim=14, action_horizon=10, max_token_len=250,
+            paligemma_variant="gemma_2b_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
     ),
     #
     # Inference DROID configs.
