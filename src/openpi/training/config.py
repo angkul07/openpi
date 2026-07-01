@@ -445,6 +445,9 @@ class LeRobotYamDataConfig(DataConfigFactory):  # noqa: F821  (DataConfigFactory
                         "observation/right_wrist_image": "observation.images.right_wrist",
                         "observation/state": "observation.state",
                         "actions": "action",
+                        # prompt_from_task adds "prompt" BEFORE this repack; it must
+                        # be listed here or RepackTransform drops it -> "Prompt is required".
+                        "prompt": "prompt",
                     }
                 )
             ]
