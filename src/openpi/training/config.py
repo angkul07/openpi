@@ -646,7 +646,7 @@ _CONFIGS = [
         name="pi0_fast_yam",
         model=pi0_fast.Pi0FASTConfig(action_dim=14, action_horizon=10, max_token_len=250),
         data=LeRobotYamDataConfig(
-            repo_id="Kavin60606/yam_pi0fast_val",
+            repo_id="Kavin60606/yam_pi0fast_train",
             base_config=DataConfig(prompt_from_task=True),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader(
@@ -662,7 +662,7 @@ _CONFIGS = [
             paligemma_variant="gemma_2b_lora",
         ),
         data=LeRobotYamDataConfig(
-            repo_id="Kavin60606/yam_pi0fast_val",
+            repo_id="Kavin60606/yam_pi0fast_train",
             base_config=DataConfig(prompt_from_task=True),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader(
