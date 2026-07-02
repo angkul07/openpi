@@ -696,8 +696,8 @@ _CONFIGS = [
             warmup_steps=1_000, peak_lr=3.5e-5, decay_steps=7_000, decay_lr=3.5e-6
         ),
         batch_size=64,           # 2x A100-80GB data-parallel -> 32 samples/GPU
-        num_workers=32,          # 3-camera video decode is the loader bottleneck; feed 2 GPUs at batch 64
-        save_interval=2_000,     # ~7 checkpoints over the run
+        num_workers=8,          # 3-camera video decode is the loader bottleneck; feed 2 GPUs at batch 64
+        save_interval=500,     # ~7 checkpoints over the run
         freeze_filter=pi0_fast.Pi0FASTConfig(
             action_dim=14, action_horizon=50, max_token_len=300,
             paligemma_variant="gemma_2b_lora",
