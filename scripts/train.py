@@ -191,6 +191,19 @@ def train_step(
     return new_state, info
 
 
+def _write_per_step_metrics(metrics_file, stacked_infos: dict, *, last_step: int, count: int) -> None:
+    """Append one line per training step from an already host-resident info batch.
+
+    `stacked_infos` holds arrays of length `count` covering the steps ending at
+    `last_step` inclusive.
+    """
+    first_step = last_step - count + 1
+    for i in range(count):
+        values = " ".join(f"{k}={float(np.asarray(v)[i]):.6f}" for k, v in stacked_infos.items())
+        metrics_file.write(f"step={first_step + i} {values}\n")
+    metrics_file.flush()
+
+
 def main(config: _config.TrainConfig):
     init_logging()
     logging.info(f"Running on: {platform.node()}")
@@ -214,6 +227,7 @@ def main(config: _config.TrainConfig):
         keep_period=config.keep_period,
         overwrite=config.overwrite,
         resume=config.resume,
+        max_to_keep=config.max_to_keep,
     )
     init_wandb(config, resuming=resuming, enabled=config.wandb_enabled)
 
@@ -255,23 +269,42 @@ def main(config: _config.TrainConfig):
         dynamic_ncols=True,
     )
 
+    # Per-step metrics, one line per training step. stdout/wandb still report the
+    # `log_interval` average; this file keeps the un-averaged history so loss and
+    # grad_norm spikes between log points are not smoothed away. It is written from
+    # the same device_get that already happens at each log point, so there is no
+    # extra host sync and no per-step pipeline stall.
+    metrics_path = config.checkpoint_dir / "train_metrics.log"
+    metrics_file = metrics_path.open("a")
+    metrics_file.write(f"# {config.name}/{config.exp_name} start_step={start_step} steps={config.num_train_steps}\n")
+    logging.info(f"Per-step metrics log: {metrics_path}")
+
     infos = []
     for step in pbar:
         with sharding.set_mesh(mesh):
             train_state, info = ptrain_step(train_rng, train_state, batch)
         infos.append(info)
         if step % config.log_interval == 0:
-            stacked_infos = common_utils.stack_forest(infos)
-            reduced_info = jax.device_get(jax.tree.map(jnp.mean, stacked_infos))
+            stacked_infos = jax.device_get(common_utils.stack_forest(infos))
+            reduced_info = jax.tree.map(np.mean, stacked_infos)
             info_str = ", ".join(f"{k}={v:.4f}" for k, v in reduced_info.items())
             pbar.write(f"Step {step}: {info_str}")
             wandb.log(reduced_info, step=step)
+            _write_per_step_metrics(metrics_file, stacked_infos, last_step=step, count=len(infos))
             infos = []
         batch = next(data_iter)
 
         if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:
             _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step)
 
+    if infos:  # steps since the last log point would otherwise never be written
+        _write_per_step_metrics(
+            metrics_file,
+            jax.device_get(common_utils.stack_forest(infos)),
+            last_step=config.num_train_steps - 1,
+            count=len(infos),
+        )
+    metrics_file.close()
     logging.info("Waiting for checkpoint manager to finish")
     checkpoint_manager.wait_until_finished()
 

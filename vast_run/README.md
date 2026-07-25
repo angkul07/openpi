@@ -13,15 +13,33 @@ them from `$HF_LEROBOT_HOME/<repo_id>` directly.
 
 ## Configs
 
-| config | p_teleop | batch split T/E | steps | warmup | save every |
-| --- | --- | --- | --- | --- | --- |
-| `pi0_fast_yam_mix_ea` | 0.50 | 32 / 32 | 50,000 | 1,000 | 5,000 |
-| `pi0_fast_yam_mix_eb` | 0.625 | 40 / 24 | 50,000 | 1,000 | 5,000 |
-| `pi0_fast_yam_mix_ec` | 0.50 | 32 / 32 | 100,000 | 2,000 | 10,000 |
+| config | p_teleop | batch split T/E | steps | warmup |
+| --- | --- | --- | --- | --- |
+| `pi0_fast_yam_mix_ea` | 0.50 | 32 / 32 | 50,000 | 1,000 |
+| `pi0_fast_yam_mix_eb` | 0.625 | 40 / 24 | 50,000 | 1,000 |
+| `pi0_fast_yam_mix_ec` | 0.50 | 32 / 32 | 100,000 | 2,000 |
 
 Everything else matches the previous 7k run: LoRA `gemma_2b_lora`, batch 64,
 peak LR 3.5e-5 → 3.5e-6 cosine (decay_steps == num_train_steps), bf16, EMA off,
 QUANTILES norm, delta joints + absolute grippers.
+
+## Checkpoints and logs
+
+All three arms save **every 1,000 steps and keep only the 4 most recent**
+(`save_interval=1000`, `max_to_keep=4`, `keep_period=None` — nothing is pinned
+permanently). That is a ~4,000-step window: eval or upload a checkpoint before it
+rolls off, or bump `max_to_keep`.
+
+| file | what |
+| --- | --- |
+| `/workspace/logs/<config>/pipeline.log` | everything `run_yam.sh` prints |
+| `/workspace/logs/<config>/norm_stats.log` | stage 1 only |
+| `/workspace/logs/<config>/train.log` | training stdout (tqdm + `log_interval` averages) |
+| `checkpoints/<config>/<exp>/train_metrics.log` | **one line per training step**, un-averaged |
+
+`train_metrics.log` is written by `train.py` from the same host transfer that
+already happens every `log_interval` steps, so per-step fidelity costs no extra
+device sync. Format: `step=N loss=... learning_rate=... grad_norm=... param_norm=...`
 
 ## Order of operations
 

@@ -643,6 +643,9 @@ class TrainConfig:
     save_interval: int = 1000
     # If set, any existing checkpoints matching step % keep_period == 0 will not be deleted.
     keep_period: int | None = 5000
+    # How many of the most recent checkpoints to keep. Checkpoints pinned by `keep_period`
+    # are kept on top of this rolling window.
+    max_to_keep: int = 1
 
     # If true, will overwrite the checkpoint directory if it already exists.
     overwrite: bool = False
@@ -833,20 +836,26 @@ _CONFIGS = [
             ),
             batch_size=64,
             num_workers=8,
-            save_interval=save_interval,
+            # Save often, keep a short rolling window: 4 x ~10GB instead of 50.
+            # keep_period=None means nothing is pinned permanently, so this really is
+            # "the most recent 4" -- eval or upload a checkpoint before it rolls off
+            # (4 checkpoints = 4k steps of headroom).
+            save_interval=1_000,
+            max_to_keep=4,
+            keep_period=None,
             freeze_filter=pi0_fast.Pi0FASTConfig(
                 action_dim=14, action_horizon=50, max_token_len=300,
                 paligemma_variant="gemma_2b_lora",
             ).get_freeze_filter(),
             ema_decay=None,
         )
-        for name, asset_id, teleop_per_batch, num_steps, warmup_steps, save_interval in [
+        for name, asset_id, teleop_per_batch, num_steps, warmup_steps in [
             # E-A: baseline ratio, matched to the previous 50/50 experiment.
-            ("pi0_fast_yam_mix_ea", "yam_mix_p50", 32, 50_000, 1_000, 5_000),
+            ("pi0_fast_yam_mix_ea", "yam_mix_p50", 32, 50_000, 1_000),
             # E-B: teleop-biased arm (62.5% gradient share on the higher-quality source).
-            ("pi0_fast_yam_mix_eb", "yam_mix_p625", 40, 50_000, 1_000, 5_000),
+            ("pi0_fast_yam_mix_eb", "yam_mix_p625", 40, 50_000, 1_000),
             # E-C: long run at the safe ratio, aligned with the official recipe length.
-            ("pi0_fast_yam_mix_ec", "yam_mix_p50", 32, 100_000, 2_000, 10_000),
+            ("pi0_fast_yam_mix_ec", "yam_mix_p50", 32, 100_000, 2_000),
         ]
     ],
     #

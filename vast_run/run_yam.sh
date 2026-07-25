@@ -14,8 +14,18 @@ cd /workspace/openpi || exit 1
 
 CONFIG="${1:-pi0_fast_yam_mix_ea}"
 EXP_NAME="${2:-${CONFIG#pi0_fast_yam_mix_}}"
-LOG=/workspace/train_${CONFIG}.log
-exec > >(tee -a "$LOG") 2>&1   # log to file AND tmux pane
+
+# Logs, all under /workspace/logs/<config>/:
+#   pipeline.log     everything this script prints (also on the tmux pane)
+#   norm_stats.log   stage 1 only
+#   train.log        stage 2 stdout (tqdm + the log_interval averages)
+# Plus checkpoints/<config>/<exp>/train_metrics.log, written by train.py itself:
+# one line per training step, un-averaged.
+LOG_DIR=/workspace/logs/${CONFIG}
+mkdir -p "$LOG_DIR"
+NORM_LOG="$LOG_DIR/norm_stats.log"
+TRAIN_LOG="$LOG_DIR/train.log"
+exec > >(tee -a "$LOG_DIR/pipeline.log") 2>&1   # log to file AND tmux pane
 
 export HF_HOME=/workspace/.hf_home
 export HF_LEROBOT_HOME=/workspace/.hf_home/lerobot
@@ -50,7 +60,9 @@ batch = cfg.batch_size
 print(f"config          : {cfg.name}")
 print(f"steps           : {cfg.num_train_steps}  (warmup {cfg.lr_schedule.warmup_steps}, "
       f"decay {cfg.lr_schedule.decay_steps}, peak {cfg.lr_schedule.peak_lr})")
-print(f"batch / workers : {batch} / {cfg.num_workers}    save_interval {cfg.save_interval}")
+print(f"batch / workers : {batch} / {cfg.num_workers}")
+print(f"checkpoints     : every {cfg.save_interval} steps, keep {cfg.max_to_keep} most recent "
+      f"(keep_period={cfg.keep_period})")
 print(f"asset_id        : {data.asset_id}")
 assert data.mixture, "config has no mixture -- wrong config name?"
 assert cfg.lr_schedule.decay_steps == cfg.num_train_steps, "decay_steps must equal num_train_steps"
@@ -76,13 +88,14 @@ if [ -s "$NORM_DIR/norm_stats.json" ]; then
   echo "norm stats already present at $NORM_DIR -- skipping"
 else
   for i in $(seq 1 40); do
-    echo "--- norm-stats attempt $i $(date -u +%H:%M:%S) ---"
+    echo "--- norm-stats attempt $i $(date -u +%H:%M:%S) ---" | tee -a "$NORM_LOG"
     uv run scripts/compute_norm_stats.py --config-name "$CONFIG" \
-      --max-frames "$NORM_FRAMES" --skip-videos && break
+      --max-frames "$NORM_FRAMES" --skip-videos 2>&1 | tee -a "$NORM_LOG" && break
     echo "[norm] attempt $i failed (likely HF 429); sleeping 330s then resuming..."
     sleep 330
   done
 fi
+echo "norm stats log  : $NORM_LOG"
 
 if [ ! -s "$NORM_DIR/norm_stats.json" ]; then
   echo "ERROR: norm stats not computed after retries; aborting before training."
@@ -90,10 +103,12 @@ if [ ! -s "$NORM_DIR/norm_stats.json" ]; then
 fi
 
 echo "===== [2/3] train (2x A100 data-parallel) $(date -u) ====="
+echo "train log       : $TRAIN_LOG"
+echo "per-step metrics: checkpoints/${CONFIG}/${EXP_NAME}/train_metrics.log"
 # NOTE: fresh run from pi0_fast_base, NOT a resume of the 7k checkpoint -- a resume
 # would drag along its exhausted cosine schedule and the old 50/50 norm stats.
 uv run scripts/train.py "$CONFIG" \
   --exp-name "$EXP_NAME" --fsdp-devices 1 --overwrite \
-  --project-name pi0-fast-modal
+  --project-name pi0-fast-modal 2>&1 | tee -a "$TRAIN_LOG"
 
 echo "===== [3/3] PIPELINE FINISHED (exit $?) $(date -u) ====="
