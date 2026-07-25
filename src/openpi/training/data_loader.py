@@ -188,6 +188,36 @@ def select_holdout_episodes(total_episodes: int, fraction: float, seed: int) -> 
     return sorted(int(x) for x in rng.choice(pool, size=num, replace=False))
 
 
+def _remap_episode_data_index(dataset: lerobot_dataset.LeRobotDataset, episodes: Sequence[int]) -> None:
+    """Re-key `episode_data_index` by original episode index.
+
+    Upstream bug (lerobot @0cf8648): `get_episode_data_index` builds `from`/`to` as
+    dense arrays *positional* over the kept episodes, but `__getitem__` looks them up
+    as `episode_data_index["from"][ep_idx]` with `ep_idx` read from the frame itself --
+    i.e. the *original* episode index. With `episodes=None` the two coincide and all is
+    well, which is why stock openpi never trips over it. As soon as episodes are held
+    out they diverge: keeping 500..999 makes ep_idx 713 index into a length-500 array
+    (IndexError), and keeping e.g. 3..1644 silently returns *another episode's*
+    boundaries, so action chunks would run across episode edges with wrong padding.
+
+    Called after `__init__`, which is deliberate: `check_timestamps_sync` consumes the
+    positional layout (`to[:-1]` = last frame of each episode in dataset order) and has
+    already run by then. Only the read path uses it afterwards.
+    """
+    kept = list(episodes)
+    lengths = [dataset.meta.episodes[ep]["length"] for ep in kept]
+    starts = np.cumsum([0, *lengths[:-1]])
+
+    size = max(kept) + 1
+    from_ = np.zeros(size, dtype=np.int64)
+    to_ = np.zeros(size, dtype=np.int64)
+    for pos, ep in enumerate(kept):
+        from_[ep] = starts[pos]
+        to_[ep] = starts[pos] + lengths[pos]
+
+    dataset.episode_data_index = {"from": torch.from_numpy(from_), "to": torch.from_numpy(to_)}
+
+
 def _create_lerobot_dataset(
     repo_id: str,
     *,
@@ -206,9 +236,7 @@ def _create_lerobot_dataset(
     held_out = {int(ep) for ep in exclude_episodes}
     out_of_range = sorted(ep for ep in held_out if not 0 <= ep < total_episodes)
     if out_of_range:
-        raise ValueError(
-            f"[{repo_id}] exclude_episodes contains indices outside [0, {total_episodes}): {out_of_range}"
-        )
+        raise ValueError(f"[{repo_id}] exclude_episodes contains indices outside [0, {total_episodes}): {out_of_range}")
     if holdout_fraction > 0.0:
         held_out |= set(select_holdout_episodes(total_episodes, holdout_fraction, holdout_seed))
 
@@ -231,6 +259,9 @@ def _create_lerobot_dataset(
             key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
         },
     )
+
+    if episodes is not None:
+        _remap_episode_data_index(dataset, episodes)
 
     if data_config.prompt_from_task:
         # Task strings are per-dataset, so this must be applied per source.
@@ -270,8 +301,7 @@ def create_torch_dataset(
         mixture = MixtureDataset(datasets, [s.repo_id for s in data_config.mixture])
         for source, size in zip(data_config.mixture, mixture.sizes, strict=True):
             logging.info(
-                f"mixture source {source.repo_id}: {size} train frames, "
-                f"{source.samples_per_batch} samples/batch"
+                f"mixture source {source.repo_id}: {size} train frames, {source.samples_per_batch} samples/batch"
             )
         return mixture
 
@@ -328,7 +358,7 @@ class StratifiedBatchSampler(torch.utils.data.Sampler[list[int]]):
         # that needs the most of them to be seen once. Purely cosmetic -- the streams
         # wrap independently and carry over across restarts.
         self._batches_per_epoch = batches_per_epoch or max(
-            1, max(size // count for size, count in zip(sizes, counts, strict=True))
+            1, *(size // count for size, count in zip(sizes, counts, strict=True))
         )
         # Each source's stream position is a pure function of the batch counter, so a
         # resume can seek straight to where the interrupted run left off instead of
@@ -633,9 +663,7 @@ def make_stratified_batch_sampler(
         )
     if start_batch:
         logging.info(f"mixture sampler: seeking to batch {start_batch} (resume)")
-    return StratifiedBatchSampler(
-        sizes, counts, offsets, seed=seed, shuffle=shuffle, start_batch=start_batch
-    )
+    return StratifiedBatchSampler(sizes, counts, offsets, seed=seed, shuffle=shuffle, start_batch=start_batch)
 
 
 def create_rlds_data_loader(
