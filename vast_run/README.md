@@ -23,6 +23,25 @@ Everything else matches the previous 7k run: LoRA `gemma_2b_lora`, batch 64,
 peak LR 3.5e-5 → 3.5e-6 cosine (decay_steps == num_train_steps), bf16, EMA off,
 QUANTILES norm, delta joints + absolute grippers.
 
+## Multi-GPU and resume
+
+**2× A100-80GB, data parallel.** `--fsdp-devices 1` makes the mesh `(num_gpus, 1)`,
+so batch 64 splits 32/GPU and each GPU holds a full copy of the LoRA model — same
+setup as the previous run. `train.py` refuses to start if `batch_size` isn't
+divisible by the device count. Raise `--fsdp-devices` only if a single GPU can't
+hold the model; it shards parameters instead and costs communication.
+
+**Resume.** Re-running `run_yam.sh` continues an interrupted run automatically:
+it uses `--resume` when the checkpoint dir already has checkpoints and
+`--overwrite` when it doesn't. `FRESH=1 ./vast_run/run_yam.sh <config>` forces a
+restart from `pi0_fast_base`. The checkpoint carries step, params, optimizer state
+and LR-schedule position; W&B reattaches to the same run via `wandb_id.txt`.
+
+The data stream also resumes: the mixture sampler seeks to `latest_step + 1` in
+O(1), so a resumed run draws the batches the interrupted one would have drawn
+instead of replaying the stream from the beginning. (Stock openpi restarts the
+shuffle on every resume — this only works for mixture configs.)
+
 ## Checkpoints and logs
 
 All three arms save **every 1,000 steps and keep only the 4 most recent**

@@ -309,6 +309,7 @@ class StratifiedBatchSampler(torch.utils.data.Sampler[list[int]]):
         seed: int = 0,
         shuffle: bool = True,
         batches_per_epoch: int | None = None,
+        start_batch: int = 0,
     ):
         if len(sizes) != len(counts) or len(sizes) != len(offsets):
             raise ValueError("sizes, counts and offsets must have the same length")
@@ -329,8 +330,14 @@ class StratifiedBatchSampler(torch.utils.data.Sampler[list[int]]):
         self._batches_per_epoch = batches_per_epoch or max(
             1, max(size // count for size, count in zip(sizes, counts, strict=True))
         )
-        self._positions = [0] * len(sizes)
-        self._batch_index = 0
+        # Each source's stream position is a pure function of the batch counter, so a
+        # resume can seek straight to where the interrupted run left off instead of
+        # replaying the start of the stream. (The ratio is exact either way; this keeps
+        # the *frames* from being re-drawn.)
+        if start_batch < 0:
+            raise ValueError(f"start_batch must be non-negative, got {start_batch}")
+        self._positions = [start_batch * count for count in self._counts]
+        self._batch_index = start_batch
         # Per source, the (epoch, permutation) currently being consumed. Only one epoch
         # per source is ever live, so this holds at most `len(sizes)` permutations.
         self._perm_cache: list[tuple[int, np.ndarray] | None] = [None] * len(sizes)
@@ -460,6 +467,7 @@ def create_data_loader(
     num_batches: int | None = None,
     skip_norm_stats: bool = False,
     framework: Literal["jax", "pytorch"] = "jax",
+    start_batch: int = 0,
 ) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
     """Create a data loader for training.
 
@@ -470,9 +478,18 @@ def create_data_loader(
         num_batches: Determines the number of batches to return.
         skip_norm_stats: Whether to skip data normalization.
         framework: The framework to use ("jax" or "pytorch").
+        start_batch: Batch index to start the data stream at, so a resumed run continues
+            the stream instead of replaying it from the beginning. Only the mixture
+            sampler can seek; other loaders ignore it (and log that they did).
     """
     data_config = config.data.create(config.assets_dirs, config.model)
     logging.info(f"data_config: {data_config}")
+
+    if start_batch and not data_config.mixture:
+        logging.warning(
+            f"start_batch={start_batch} ignored: only the mixture sampler can seek. "
+            "The data stream restarts from the beginning (stock openpi behaviour)."
+        )
 
     if data_config.rlds_data_dir is not None:
         return create_rlds_data_loader(
@@ -497,6 +514,7 @@ def create_data_loader(
         seed=config.seed,
         skip_norm_stats=skip_norm_stats,
         framework=framework,
+        start_batch=start_batch,
     )
 
 
@@ -513,6 +531,7 @@ def create_torch_data_loader(
     num_workers: int = 0,
     seed: int = 0,
     framework: str = "jax",
+    start_batch: int = 0,
 ) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
     """Create a data loader for training.
 
@@ -563,7 +582,13 @@ def create_torch_data_loader(
         if sampler is not None:
             raise NotImplementedError("Mixture sampling is not supported with PyTorch DDP samplers.")
         batch_sampler = make_stratified_batch_sampler(
-            data_config, mixture_sizes, mixture_offsets, local_batch_size, seed=seed, shuffle=shuffle
+            data_config,
+            mixture_sizes,
+            mixture_offsets,
+            local_batch_size,
+            seed=seed,
+            shuffle=shuffle,
+            start_batch=start_batch,
         )
 
     data_loader = TorchDataLoader(
@@ -590,6 +615,7 @@ def make_stratified_batch_sampler(
     *,
     seed: int = 0,
     shuffle: bool = True,
+    start_batch: int = 0,
 ) -> StratifiedBatchSampler:
     """Build the fixed-count mixture sampler and check it adds up to the batch size."""
     counts = [source.samples_per_batch for source in data_config.mixture]
@@ -605,7 +631,11 @@ def make_stratified_batch_sampler(
             f"({share:.1%} gradient share), {size} frames, "
             f"{count / batch_size / (size / sum(sizes)):.2f}x its storage share"
         )
-    return StratifiedBatchSampler(sizes, counts, offsets, seed=seed, shuffle=shuffle)
+    if start_batch:
+        logging.info(f"mixture sampler: seeking to batch {start_batch} (resume)")
+    return StratifiedBatchSampler(
+        sizes, counts, offsets, seed=seed, shuffle=shuffle, start_batch=start_batch
+    )
 
 
 def create_rlds_data_loader(

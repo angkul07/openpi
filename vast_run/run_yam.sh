@@ -104,12 +104,32 @@ if [ ! -s "$NORM_DIR/norm_stats.json" ]; then
 fi
 
 echo "===== [2/3] train (2x A100 data-parallel) $(date -u) ====="
-echo "train log       : $TRAIN_LOG"
-echo "per-step metrics: checkpoints/${CONFIG}/${EXP_NAME}/train_metrics.log"
-# NOTE: fresh run from pi0_fast_base, NOT a resume of the 7k checkpoint -- a resume
+# Re-running this script must not destroy a run in progress: if the checkpoint dir
+# already has a numbered checkpoint, continue it; otherwise start clean. FRESH=1
+# forces a restart (wipes the checkpoint dir).
+# NOTE: "fresh" means from pi0_fast_base, NOT from the old 7k checkpoint -- that
 # would drag along its exhausted cosine schedule and the old 50/50 norm stats.
+CKPT_DIR="checkpoints/${CONFIG}/${EXP_NAME}"
+shopt -s nullglob
+EXISTING=("$CKPT_DIR"/[0-9]*)
+shopt -u nullglob
+if [ "${FRESH:-0}" = "1" ]; then
+  MODE=--overwrite
+  echo "mode            : FRESH (wiping $CKPT_DIR)"
+elif [ ${#EXISTING[@]} -gt 0 ]; then
+  MODE=--resume
+  echo "mode            : RESUME (existing checkpoints: ${EXISTING[*]##*/})"
+else
+  MODE=--overwrite
+  echo "mode            : fresh start (no checkpoints in $CKPT_DIR)"
+fi
+echo "train log       : $TRAIN_LOG"
+echo "per-step metrics: $CKPT_DIR/train_metrics.log"
+
+# --fsdp-devices 1 = pure data parallel: mesh is (num_gpus, 1), so batch 64 splits
+# 32/GPU across the 2 A100s and every GPU holds a full copy of the LoRA model.
 uv run scripts/train.py "$CONFIG" \
-  --exp-name "$EXP_NAME" --fsdp-devices 1 --overwrite \
+  --exp-name "$EXP_NAME" --fsdp-devices 1 "$MODE" \
   --project-name pi0-fast-modal 2>&1 | tee -a "$TRAIN_LOG"
 
 echo "===== [3/3] PIPELINE FINISHED (exit $?) $(date -u) ====="

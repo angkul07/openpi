@@ -231,10 +231,17 @@ def main(config: _config.TrainConfig):
     )
     init_wandb(config, resuming=resuming, enabled=config.wandb_enabled)
 
+    # On resume, seek the data stream forward to where the interrupted run stopped
+    # instead of replaying it from the start. The checkpoint holds the completed step,
+    # and batch index N feeds train step N, so the next batch to draw is latest_step + 1.
+    # (Only the mixture sampler can seek; other loaders log that they ignored this.)
+    resume_batch = int(checkpoint_manager.latest_step()) + 1 if resuming else 0
+
     data_loader = _data_loader.create_data_loader(
         config,
         sharding=data_sharding,
         shuffle=True,
+        start_batch=resume_batch,
     )
     data_iter = iter(data_loader)
     batch = next(data_iter)
@@ -262,6 +269,15 @@ def main(config: _config.TrainConfig):
     )
 
     start_step = int(train_state.step)
+    if resuming:
+        logging.info(f"Resuming at step {start_step} (data stream sought to batch {resume_batch})")
+        if start_step != resume_batch:
+            # Not fatal -- a mismatch only means the stream is offset by a few batches --
+            # but it means the checkpoint's step and the seek disagree, so say so.
+            logging.warning(
+                f"Resume step {start_step} != data stream seek {resume_batch}; "
+                "the data stream is offset by that many batches."
+            )
     pbar = tqdm.tqdm(
         range(start_step, config.num_train_steps),
         initial=start_step,
