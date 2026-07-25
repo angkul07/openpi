@@ -203,6 +203,12 @@ def _remap_episode_data_index(dataset: lerobot_dataset.LeRobotDataset, episodes:
     Called after `__init__`, which is deliberate: `check_timestamps_sync` consumes the
     positional layout (`to[:-1]` = last frame of each episode in dataset order) and has
     already run by then. Only the read path uses it afterwards.
+
+    Applied unconditionally. For a plain contiguous 0..N-1 dataset the two layouts are
+    identical and this is a no-op, so there is no reason to make it conditional -- and
+    `episodes=None` is *not* a safe proxy for "contiguous": a dataset whose meta lists a
+    non-contiguous subset (e.g. an extracted holdout folder keeping original indices)
+    hits the same bug with no episodes= argument in sight.
     """
     kept = list(episodes)
     lengths = [dataset.meta.episodes[ep]["length"] for ep in kept]
@@ -260,8 +266,7 @@ def _create_lerobot_dataset(
         },
     )
 
-    if episodes is not None:
-        _remap_episode_data_index(dataset, episodes)
+    _remap_episode_data_index(dataset, episodes if episodes is not None else sorted(dataset_meta.episodes))
 
     if data_config.prompt_from_task:
         # Task strings are per-dataset, so this must be applied per source.
