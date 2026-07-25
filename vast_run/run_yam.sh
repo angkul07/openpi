@@ -71,8 +71,9 @@ assert total == batch, f"mixture counts {total} != batch size {batch}"
 for s in data.mixture:
     p = s.samples_per_batch / batch
     epochs = p * batch * cfg.num_train_steps
+    held = f"{len(s.exclude_episodes)} episodes" if s.exclude_episodes else f"fraction {s.holdout_fraction}"
     print(f"  {s.repo_id:52s} {s.samples_per_batch:3d}/{batch} per batch "
-          f"({p:.1%} gradient share), holdout={s.holdout_fraction}, "
+          f"({p:.1%} gradient share), held out: {held}, "
           f"{epochs:,.0f} frame-visits over the run")
 pathlib.Path(sys.argv[2]).write_text(data.asset_id)
 print("CONFIG OK")

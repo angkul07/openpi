@@ -76,11 +76,17 @@ uv run vast_run/upload_ckpt.py --config pi0_fast_yam_mix_ea
 - **These are fresh runs from `pi0_fast_base`, not resumes of the 7k checkpoint.**
   Resuming would drag along the exhausted cosine schedule and the old 50/50
   EgoDex norm stats.
-- **Validation split.** Each config withholds 10% of teleop episodes from training
-  (`holdout_fraction=0.1`, `holdout_seed=0`, deterministic, printed at startup) so
-  offline eval scores on unseen episodes. Ego has no holdout by design — headline
-  metrics are teleop-only. Set `holdout_fraction=0.0` in the config to train on
-  everything.
+- **Validation split is currently OFF** — every teleop episode is trained on. When
+  you pick the held-out episodes on the box, list their indices in the teleop
+  `MixtureSource`:
+  ```python
+  MixtureSource(repo_id="angkul07/abc-teleop", samples_per_batch=32,
+                exclude_episodes=(3, 17, 42))
+  ```
+  They drop out of the training stream with nothing moved on disk, and the count is
+  printed at startup. (`holdout_fraction=0.1, holdout_seed=0` is the alternative —
+  a deterministic random split matching fidelity-sdk's `HoldoutSpec`.) Ego gets no
+  holdout either way: headline metrics are teleop-only by design.
 - **Augmentation is training-only** (`DataConfig.train_only_transforms`), so it is
   off at eval/serving by construction: photometric jitter on all 3 cameras,
   random crop-and-resize on the **top camera only** (wrist views are pose-coupled),

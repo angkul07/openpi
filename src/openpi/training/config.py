@@ -79,8 +79,14 @@ class MixtureSource:
     samples_per_batch: int
     # Optional local dataset root. If None, LeRobot resolves $HF_LEROBOT_HOME/<repo_id>.
     root: str | None = None
-    # Fraction of this source's episodes to withhold from training (validation split).
-    # Selection is deterministic given `holdout_seed`; see `select_holdout_episodes`.
+    # Explicit episode indices to withhold from training. Use this when the validation
+    # episodes are chosen by hand (inspected on the box) rather than sampled: list them
+    # here and they are excluded from the training stream without touching the dataset
+    # on disk. Out-of-range indices raise rather than being silently ignored.
+    exclude_episodes: Sequence[int] = ()
+    # Alternative to `exclude_episodes`: withhold a deterministic random fraction of this
+    # source's episodes. Selection matches fidelity-sdk's HoldoutSpec given the same seed;
+    # see `select_holdout_episodes`. The two can be combined (the union is withheld).
     holdout_fraction: float = 0.0
     holdout_seed: int = 0
 
@@ -812,11 +818,11 @@ _CONFIGS = [
                     MixtureSource(
                         repo_id="angkul07/abc-teleop",
                         samples_per_batch=teleop_per_batch,
-                        # Validation split: withheld from training so the offline eval
-                        # (fidelity-sdk `HoldoutSpec("teleop:0.1", seed=0)`) scores on
-                        # episodes the policy has never seen. Set to 0.0 to train on all.
-                        holdout_fraction=0.1,
-                        holdout_seed=0,
+                        # No holdout: trains on every teleop episode. The validation
+                        # episodes are picked by hand on the box; once chosen, list their
+                        # indices here, e.g. exclude_episodes=(3, 17, 42), and they drop
+                        # out of the training stream with no changes on disk.
+                        exclude_episodes=(),
                     ),
                     MixtureSource(
                         repo_id="angkul07/EgoDex-PickPlace-YAM-14dof-multiview",

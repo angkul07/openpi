@@ -194,20 +194,32 @@ def _create_lerobot_dataset(
     root: str | None,
     action_horizon: int,
     data_config: _config.DataConfig,
+    exclude_episodes: Sequence[int] = (),
     holdout_fraction: float = 0.0,
     holdout_seed: int = 0,
     skip_videos: bool = False,
 ) -> Dataset:
     """Create one LeRobot dataset, optionally excluding a validation episode split."""
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id, root=root)
+    total_episodes = dataset_meta.total_episodes
+
+    held_out = {int(ep) for ep in exclude_episodes}
+    out_of_range = sorted(ep for ep in held_out if not 0 <= ep < total_episodes)
+    if out_of_range:
+        raise ValueError(
+            f"[{repo_id}] exclude_episodes contains indices outside [0, {total_episodes}): {out_of_range}"
+        )
+    if holdout_fraction > 0.0:
+        held_out |= set(select_holdout_episodes(total_episodes, holdout_fraction, holdout_seed))
 
     episodes = None
-    if holdout_fraction > 0.0:
-        held_out = select_holdout_episodes(dataset_meta.total_episodes, holdout_fraction, holdout_seed)
-        episodes = [ep for ep in range(dataset_meta.total_episodes) if ep not in set(held_out)]
+    if held_out:
+        episodes = [ep for ep in range(total_episodes) if ep not in held_out]
+        if not episodes:
+            raise ValueError(f"[{repo_id}] every episode is held out; nothing left to train on")
         logging.info(
-            f"[{repo_id}] holding out {len(held_out)}/{dataset_meta.total_episodes} episodes from training "
-            f"(fraction={holdout_fraction}, seed={holdout_seed}); first few: {held_out[:10]}"
+            f"[{repo_id}] holding out {len(held_out)}/{total_episodes} episodes from training; "
+            f"first few: {sorted(held_out)[:10]}"
         )
 
     dataset_cls = _NoVideoLeRobotDataset if skip_videos else lerobot_dataset.LeRobotDataset
@@ -248,6 +260,7 @@ def create_torch_dataset(
                 root=source.root,
                 action_horizon=action_horizon,
                 data_config=data_config,
+                exclude_episodes=source.exclude_episodes,
                 holdout_fraction=source.holdout_fraction,
                 holdout_seed=source.holdout_seed,
                 skip_videos=skip_videos,
