@@ -8,8 +8,12 @@ at a **fixed per-batch ratio** so teleop's gradient share is set explicitly:
 | teleop (real robot) | `angkul07/abc-teleop` | ~540k | 32 / 64 |
 | ego (retargeted) | `angkul07/EgoDex-PickPlace-YAM-14dof-multiview` | ~1080k | 32 / 64 |
 
-Both datasets are already v2.1 — nothing is converted, `LeRobotDataset` reads
-them from `$HF_LEROBOT_HOME/<repo_id>` directly.
+Both datasets are already v2.1 — **nothing is converted**. `LeRobotDataset` reads
+them from `$HF_LEROBOT_HOME/<repo_id>` as-is; openpi's `examples/*/convert_*.py`
+scripts are manual-only and are never invoked by this pipeline. Stage [0/3] asserts
+each source's `meta/info.json` `codebase_version` matches the pinned lerobot
+(`v2.1`) and aborts otherwise, since a version mismatch is exactly what would send
+lerobot looking for a migration path.
 
 ## Configs
 

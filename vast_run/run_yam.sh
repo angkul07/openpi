@@ -50,8 +50,11 @@ echo "===== [0/3] resolve config $(date -u) ====="
 # the actual sampled mixture so the ratio in the log is the ratio that ran.
 ASSET_ID_FILE=/tmp/${CONFIG}_asset_id.txt
 uv run python - "$CONFIG" "$ASSET_ID_FILE" <<'PY' || exit 1
+import json
+import os
 import pathlib
 import sys
+import lerobot.common.datasets.lerobot_dataset as _lerobot
 import openpi.training.config as _config
 
 cfg = _config.get_config(sys.argv[1])
@@ -75,6 +78,24 @@ for s in data.mixture:
     print(f"  {s.repo_id:52s} {s.samples_per_batch:3d}/{batch} per batch "
           f"({p:.1%} gradient share), held out: {held}, "
           f"{epochs:,.0f} frame-visits over the run")
+
+# Both datasets are authored as LeRobot v2.1, so nothing may be converted or rewritten:
+# training reads the downloaded files as-is. Assert that here rather than trusting it --
+# a version mismatch is exactly what would make lerobot reach for a migration path.
+lerobot_home = pathlib.Path(os.environ.get("HF_LEROBOT_HOME", pathlib.Path.home() / ".cache/huggingface/lerobot"))
+for s in data.mixture:
+    root = pathlib.Path(s.root) if s.root else lerobot_home / s.repo_id
+    info = root / "meta" / "info.json"
+    if not info.is_file():
+        raise SystemExit(f"ERROR: {s.repo_id} not found at {root} -- download it before training (vast_run/dl.py)")
+    version = json.loads(info.read_text())["codebase_version"]
+    if version != _lerobot.CODEBASE_VERSION:
+        raise SystemExit(
+            f"ERROR: {s.repo_id} is {version}, but this lerobot expects {_lerobot.CODEBASE_VERSION}. "
+            "Refusing to run: converting/migrating the dataset in place is not part of this pipeline."
+        )
+    print(f"  {s.repo_id:52s} {version} at {root} (read as-is, no conversion)")
+
 pathlib.Path(sys.argv[2]).write_text(data.asset_id)
 print("CONFIG OK")
 PY
