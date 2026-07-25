@@ -1,3 +1,4 @@
+import bisect
 from collections.abc import Iterator, Sequence
 import logging
 import multiprocessing
@@ -127,8 +128,111 @@ class FakeDataset(Dataset):
         return self._num_samples
 
 
+class MixtureDataset(Dataset):
+    """Concatenation of several datasets that keeps track of per-source boundaries.
+
+    Indices are global: source `s` owns `[offsets[s], offsets[s] + sizes[s])`.
+    `StratifiedBatchSampler` uses `sizes`/`offsets` to build fixed-ratio batches.
+    """
+
+    def __init__(self, datasets: Sequence[Dataset], repo_ids: Sequence[str]):
+        if not datasets:
+            raise ValueError("MixtureDataset requires at least one source dataset.")
+        self._datasets = list(datasets)
+        self.repo_ids = list(repo_ids)
+        self.sizes = [len(d) for d in self._datasets]
+        # Cumulative boundaries; `_cum[s]` is the global start index of source s.
+        self._cum = [0]
+        for size in self.sizes:
+            self._cum.append(self._cum[-1] + size)
+        self.offsets = self._cum[:-1]
+
+    def __getitem__(self, index: SupportsIndex):
+        idx = int(index.__index__())
+        if not 0 <= idx < self._cum[-1]:
+            raise IndexError(f"index {idx} out of range for mixture of size {self._cum[-1]}")
+        source = bisect.bisect_right(self._cum, idx) - 1
+        return self._datasets[source][idx - self._cum[source]]
+
+    def __len__(self) -> int:
+        return self._cum[-1]
+
+
+class _NoVideoLeRobotDataset(lerobot_dataset.LeRobotDataset):
+    """LeRobotDataset that returns dummy frames instead of decoding video.
+
+    Only used by `compute_norm_stats.py`: normalization statistics are computed over
+    `state` / `actions` (parquet columns) and never touch pixels, but the standard
+    `__getitem__` decodes every camera anyway, which dominates runtime by ~2 orders
+    of magnitude on a 1.6M-frame mixture.
+    """
+
+    def _query_videos(self, query_timestamps: dict[str, list[float]], ep_idx: int):
+        return {key: torch.zeros(3, 2, 2, dtype=torch.uint8) for key in query_timestamps}
+
+
+def select_holdout_episodes(total_episodes: int, fraction: float, seed: int) -> list[int]:
+    """Deterministically pick validation episode indices.
+
+    Matches fidelity-sdk's `HoldoutSpec.select` math (n = max(1, round(N * fraction)),
+    `default_rng(seed).choice` without replacement) so the episodes withheld here are
+    the same ones the offline eval scores on.
+    """
+    if fraction <= 0.0:
+        return []
+    if not 0.0 < fraction < 1.0:
+        raise ValueError(f"holdout_fraction must be in (0, 1), got {fraction}")
+    pool = list(range(total_episodes))
+    num = max(1, round(len(pool) * fraction))
+    rng = np.random.default_rng(seed)
+    return sorted(int(x) for x in rng.choice(pool, size=num, replace=False))
+
+
+def _create_lerobot_dataset(
+    repo_id: str,
+    *,
+    root: str | None,
+    action_horizon: int,
+    data_config: _config.DataConfig,
+    holdout_fraction: float = 0.0,
+    holdout_seed: int = 0,
+    skip_videos: bool = False,
+) -> Dataset:
+    """Create one LeRobot dataset, optionally excluding a validation episode split."""
+    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id, root=root)
+
+    episodes = None
+    if holdout_fraction > 0.0:
+        held_out = select_holdout_episodes(dataset_meta.total_episodes, holdout_fraction, holdout_seed)
+        episodes = [ep for ep in range(dataset_meta.total_episodes) if ep not in set(held_out)]
+        logging.info(
+            f"[{repo_id}] holding out {len(held_out)}/{dataset_meta.total_episodes} episodes from training "
+            f"(fraction={holdout_fraction}, seed={holdout_seed}); first few: {held_out[:10]}"
+        )
+
+    dataset_cls = _NoVideoLeRobotDataset if skip_videos else lerobot_dataset.LeRobotDataset
+    dataset = dataset_cls(
+        repo_id,
+        root=root,
+        episodes=episodes,
+        delta_timestamps={
+            key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
+        },
+    )
+
+    if data_config.prompt_from_task:
+        # Task strings are per-dataset, so this must be applied per source.
+        dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
+
+    return dataset
+
+
 def create_torch_dataset(
-    data_config: _config.DataConfig, action_horizon: int, model_config: _model.BaseModelConfig
+    data_config: _config.DataConfig,
+    action_horizon: int,
+    model_config: _model.BaseModelConfig,
+    *,
+    skip_videos: bool = False,
 ) -> Dataset:
     """Create a dataset for training."""
     repo_id = data_config.repo_id
@@ -137,18 +241,122 @@ def create_torch_dataset(
     if repo_id == "fake":
         return FakeDataset(model_config, num_samples=1024)
 
-    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
-    dataset = lerobot_dataset.LeRobotDataset(
-        data_config.repo_id,
-        delta_timestamps={
-            key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
-        },
+    if data_config.mixture:
+        datasets = [
+            _create_lerobot_dataset(
+                source.repo_id,
+                root=source.root,
+                action_horizon=action_horizon,
+                data_config=data_config,
+                holdout_fraction=source.holdout_fraction,
+                holdout_seed=source.holdout_seed,
+                skip_videos=skip_videos,
+            )
+            for source in data_config.mixture
+        ]
+        mixture = MixtureDataset(datasets, [s.repo_id for s in data_config.mixture])
+        for source, size in zip(data_config.mixture, mixture.sizes, strict=True):
+            logging.info(
+                f"mixture source {source.repo_id}: {size} train frames, "
+                f"{source.samples_per_batch} samples/batch"
+            )
+        return mixture
+
+    return _create_lerobot_dataset(
+        repo_id,
+        root=None,
+        action_horizon=action_horizon,
+        data_config=data_config,
+        skip_videos=skip_videos,
     )
 
-    if data_config.prompt_from_task:
-        dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
 
-    return dataset
+class StratifiedBatchSampler(torch.utils.data.Sampler[list[int]]):
+    """Yields batches with an exact, fixed number of samples from each source.
+
+    Every batch contains `counts[s]` indices from source `s`, so the gradient share
+    of a source is `counts[s] / sum(counts)` exactly -- no loss weighting involved.
+
+    Each source has its own index stream: a random permutation of the source that is
+    consumed in order and reshuffled (with a new permutation) when it wraps around.
+    Because sources have different sizes and different per-batch counts, they wrap at
+    different rates, which is the whole point (teleop is visited ~2x per ego visit at
+    32/32 over a 540k/1080k split).
+
+    The stream position is a monotonically increasing counter that survives dataloader
+    epoch restarts, so torch re-iterating the sampler does not replay the same batches.
+    """
+
+    def __init__(
+        self,
+        sizes: Sequence[int],
+        counts: Sequence[int],
+        offsets: Sequence[int],
+        *,
+        seed: int = 0,
+        shuffle: bool = True,
+        batches_per_epoch: int | None = None,
+    ):
+        if len(sizes) != len(counts) or len(sizes) != len(offsets):
+            raise ValueError("sizes, counts and offsets must have the same length")
+        for size, count, repo_index in zip(sizes, counts, range(len(sizes)), strict=True):
+            if count <= 0:
+                raise ValueError(f"source {repo_index} has non-positive samples_per_batch={count}")
+            if size < count:
+                raise ValueError(f"source {repo_index} has {size} frames, fewer than its per-batch count {count}")
+
+        self._sizes = list(sizes)
+        self._counts = list(counts)
+        self._offsets = list(offsets)
+        self._seed = seed
+        self._shuffle = shuffle
+        # One "epoch" for torch's iterator bookkeeping: enough batches for the source
+        # that needs the most of them to be seen once. Purely cosmetic -- the streams
+        # wrap independently and carry over across restarts.
+        self._batches_per_epoch = batches_per_epoch or max(
+            1, max(size // count for size, count in zip(sizes, counts, strict=True))
+        )
+        self._positions = [0] * len(sizes)
+        self._batch_index = 0
+        # Per source, the (epoch, permutation) currently being consumed. Only one epoch
+        # per source is ever live, so this holds at most `len(sizes)` permutations.
+        self._perm_cache: list[tuple[int, np.ndarray] | None] = [None] * len(sizes)
+
+    @property
+    def batch_size(self) -> int:
+        return sum(self._counts)
+
+    def _permutation(self, source: int, epoch: int) -> np.ndarray:
+        cached = self._perm_cache[source]
+        if cached is None or cached[0] != epoch:
+            size = self._sizes[source]
+            if self._shuffle:
+                perm = np.random.default_rng([self._seed, source, epoch]).permutation(size)
+            else:
+                perm = np.arange(size)
+            self._perm_cache[source] = (epoch, perm)
+            return perm
+        return cached[1]
+
+    def _next_index(self, source: int) -> int:
+        size = self._sizes[source]
+        position = self._positions[source]
+        self._positions[source] = position + 1
+        perm = self._permutation(source, position // size)
+        return self._offsets[source] + int(perm[position % size])
+
+    def __iter__(self) -> Iterator[list[int]]:
+        for _ in range(self._batches_per_epoch):
+            batch = [self._next_index(s) for s, count in enumerate(self._counts) for _ in range(count)]
+            if self._shuffle:
+                # Shuffle within the batch so source order inside a batch is not fixed.
+                order = np.random.default_rng([self._seed, 0xB47C4, self._batch_index]).permutation(len(batch))
+                batch = [batch[i] for i in order]
+            self._batch_index += 1
+            yield batch
+
+    def __len__(self) -> int:
+        return self._batches_per_epoch
 
 
 def create_rlds_dataset(
@@ -169,7 +377,13 @@ def create_rlds_dataset(
     )
 
 
-def transform_dataset(dataset: Dataset, data_config: _config.DataConfig, *, skip_norm_stats: bool = False) -> Dataset:
+def transform_dataset(
+    dataset: Dataset,
+    data_config: _config.DataConfig,
+    *,
+    skip_norm_stats: bool = False,
+    skip_train_only_transforms: bool = False,
+) -> Dataset:
     """Transform the dataset by applying the data transforms."""
     norm_stats = {}
     if data_config.repo_id != "fake" and not skip_norm_stats:
@@ -180,11 +394,16 @@ def transform_dataset(dataset: Dataset, data_config: _config.DataConfig, *, skip
             )
         norm_stats = data_config.norm_stats
 
+    train_only = () if skip_train_only_transforms else data_config.train_only_transforms.inputs
+
     return TransformedDataset(
         dataset,
         [
             *data_config.repack_transforms.inputs,
             *data_config.data_transforms.inputs,
+            # Training-only (e.g. image augmentation): before normalization, and never
+            # part of the inference chain.
+            *train_only,
             _transforms.Normalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
             *data_config.model_transforms.inputs,
         ],
@@ -300,6 +519,8 @@ def create_torch_data_loader(
         seed: The seed to use for shuffling the data.
     """
     dataset = create_torch_dataset(data_config, action_horizon, model_config)
+    mixture_sizes = getattr(dataset, "sizes", None) if isinstance(dataset, MixtureDataset) else None
+    mixture_offsets = dataset.offsets if isinstance(dataset, MixtureDataset) else None
     dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
 
     # Use TorchDataLoader for both frameworks
@@ -322,12 +543,23 @@ def create_torch_data_loader(
         local_batch_size = batch_size // jax.process_count()
 
     logging.info(f"local_batch_size: {local_batch_size}")
+
+    batch_sampler = None
+    if mixture_sizes is not None:
+        assert mixture_offsets is not None
+        if sampler is not None:
+            raise NotImplementedError("Mixture sampling is not supported with PyTorch DDP samplers.")
+        batch_sampler = make_stratified_batch_sampler(
+            data_config, mixture_sizes, mixture_offsets, local_batch_size, seed=seed, shuffle=shuffle
+        )
+
     data_loader = TorchDataLoader(
         dataset,
         local_batch_size=local_batch_size,
         sharding=None if framework == "pytorch" else sharding,
-        shuffle=(sampler is None and shuffle),  # Don't shuffle if using sampler
+        shuffle=(sampler is None and batch_sampler is None and shuffle),  # Don't shuffle if using a sampler
         sampler=sampler,
+        batch_sampler=batch_sampler,
         num_batches=num_batches,
         num_workers=num_workers,
         seed=seed,
@@ -335,6 +567,32 @@ def create_torch_data_loader(
     )
 
     return DataLoaderImpl(data_config, data_loader)
+
+
+def make_stratified_batch_sampler(
+    data_config: _config.DataConfig,
+    sizes: Sequence[int],
+    offsets: Sequence[int],
+    batch_size: int,
+    *,
+    seed: int = 0,
+    shuffle: bool = True,
+) -> StratifiedBatchSampler:
+    """Build the fixed-count mixture sampler and check it adds up to the batch size."""
+    counts = [source.samples_per_batch for source in data_config.mixture]
+    if sum(counts) != batch_size:
+        raise ValueError(
+            f"Mixture samples_per_batch {counts} sums to {sum(counts)}, which does not match the "
+            f"batch size {batch_size}. Fix the config so every batch is exactly full."
+        )
+    for source, count, size in zip(data_config.mixture, counts, sizes, strict=True):
+        share = count / batch_size
+        logging.info(
+            f"mixture sampler: {source.repo_id} -> {count}/{batch_size} per batch "
+            f"({share:.1%} gradient share), {size} frames, "
+            f"{count / batch_size / (size / sum(sizes)):.2f}x its storage share"
+        )
+    return StratifiedBatchSampler(sizes, counts, offsets, seed=seed, shuffle=shuffle)
 
 
 def create_rlds_data_loader(
@@ -389,6 +647,7 @@ class TorchDataLoader:
         sharding: jax.sharding.Sharding | None = None,
         shuffle: bool = False,
         sampler: torch.utils.data.Sampler | None = None,
+        batch_sampler: torch.utils.data.Sampler[list[int]] | None = None,
         num_batches: int | None = None,
         num_workers: int = 0,
         seed: int = 0,
@@ -401,6 +660,9 @@ class TorchDataLoader:
             local_batch_size: The local batch size for each process.
             sharding: The sharding to use for the data loader.
             shuffle: Whether to shuffle the data.
+            batch_sampler: If provided, yields whole batches of indices and takes over
+                batching entirely (used for fixed-ratio mixture sampling). Mutually
+                exclusive with `shuffle`/`sampler`/`local_batch_size`.
             num_batches: If provided, determines the number of returned batches. If the
                 number is larger than the number of batches in the dataset, the data loader
                 will loop over the dataset. If not provided, will iterate over the dataset
@@ -431,18 +693,27 @@ class TorchDataLoader:
 
         generator = torch.Generator()
         generator.manual_seed(seed)
+        # A batch_sampler already defines batching, so torch forbids passing
+        # batch_size/shuffle/sampler/drop_last alongside it.
+        batching_kwargs: dict[str, typing.Any] = (
+            {"batch_sampler": batch_sampler}
+            if batch_sampler is not None
+            else {
+                "batch_size": local_batch_size,
+                "shuffle": (sampler is None and shuffle),  # Don't shuffle if using sampler
+                "sampler": sampler,
+                "drop_last": True,
+            }
+        )
         self._data_loader = torch.utils.data.DataLoader(
             typing.cast(torch.utils.data.Dataset, dataset),
-            batch_size=local_batch_size,
-            shuffle=(sampler is None and shuffle),  # Don't shuffle if using sampler
-            sampler=sampler,
             num_workers=num_workers,
             multiprocessing_context=mp_context,
             persistent_workers=num_workers > 0,
             collate_fn=_collate_fn,
             worker_init_fn=_worker_init_fn,
-            drop_last=True,
             generator=generator,
+            **batching_kwargs,
         )
 
     @property

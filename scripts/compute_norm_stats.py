@@ -28,15 +28,22 @@ def create_torch_dataloader(
     model_config: _model.BaseModelConfig,
     num_workers: int,
     max_frames: int | None = None,
+    skip_videos: bool = False,
 ) -> tuple[_data_loader.Dataset, int]:
     if data_config.repo_id is None:
         raise ValueError("Data config must have a repo_id")
-    dataset = _data_loader.create_torch_dataset(data_config, action_horizon, model_config)
+    dataset = _data_loader.create_torch_dataset(
+        data_config, action_horizon, model_config, skip_videos=skip_videos
+    )
+    mixture_sizes = dataset.sizes if isinstance(dataset, _data_loader.MixtureDataset) else None
+    mixture_offsets = dataset.offsets if isinstance(dataset, _data_loader.MixtureDataset) else None
     dataset = _data_loader.TransformedDataset(
         dataset,
         [
             *data_config.repack_transforms.inputs,
             *data_config.data_transforms.inputs,
+            # NOTE: train_only_transforms (image augmentation) is deliberately NOT applied
+            # here -- norm stats must describe the un-augmented state/action distribution.
             # Remove strings since they are not supported by JAX and are not needed to compute norm stats.
             RemoveStrings(),
         ],
@@ -47,11 +54,29 @@ def create_torch_dataloader(
     else:
         num_batches = len(dataset) // batch_size
         shuffle = False
+
+    batch_sampler = None
+    if mixture_sizes is not None:
+        assert mixture_offsets is not None
+        # Draw through the SAME fixed-ratio sampler used for training, so the stats
+        # describe the sampled mixture (e.g. 50/50) rather than the raw storage ratio
+        # (33/67), which would be ego-dominated and would misnormalize teleop.
+        batch_sampler = _data_loader.make_stratified_batch_sampler(
+            data_config, mixture_sizes, mixture_offsets, batch_size, shuffle=True
+        )
+        if max_frames is None:
+            raise ValueError(
+                "Computing norm stats over a mixture requires --max-frames: a full pass would "
+                "oversample the smaller source many times over. 200k frames is plenty for QUANTILES."
+            )
+        num_batches = max_frames // batch_size
+
     data_loader = _data_loader.TorchDataLoader(
         dataset,
         local_batch_size=batch_size,
         num_workers=num_workers,
-        shuffle=shuffle,
+        shuffle=shuffle and batch_sampler is None,
+        batch_sampler=batch_sampler,
         num_batches=num_batches,
     )
     return data_loader, num_batches
@@ -86,7 +111,16 @@ def create_rlds_dataloader(
     return data_loader, num_batches
 
 
-def main(config_name: str, max_frames: int | None = None):
+def main(config_name: str, max_frames: int | None = None, skip_videos: bool = False):
+    """Compute norm stats for a config.
+
+    Args:
+        config_name: Name of the train config.
+        max_frames: Number of frames to sample. Required for mixture configs.
+        skip_videos: Skip video decoding entirely (dummy 2x2 frames). Norm stats only
+            use `state`/`actions` from parquet, so this is a pure speedup -- on the
+            YAM mixture it is the difference between ~hours and ~minutes.
+    """
     config = _config.get_config(config_name)
     data_config = config.data.create(config.assets_dirs, config.model)
 
@@ -96,7 +130,13 @@ def main(config_name: str, max_frames: int | None = None):
         )
     else:
         data_loader, num_batches = create_torch_dataloader(
-            data_config, config.model.action_horizon, config.batch_size, config.model, config.num_workers, max_frames
+            data_config,
+            config.model.action_horizon,
+            config.batch_size,
+            config.model,
+            config.num_workers,
+            max_frames,
+            skip_videos=skip_videos,
         )
 
     keys = ["state", "actions"]
@@ -108,7 +148,9 @@ def main(config_name: str, max_frames: int | None = None):
 
     norm_stats = {key: stats.get_statistics() for key, stats in stats.items()}
 
-    output_path = config.assets_dirs / data_config.repo_id
+    # asset_id, not repo_id: a mixture has several repo ids, and different mixture
+    # ratios need their own stats even when the source datasets are identical.
+    output_path = config.assets_dirs / (data_config.asset_id or data_config.repo_id)
     print(f"Writing stats to: {output_path}")
     normalize.save(output_path, norm_stats)
 

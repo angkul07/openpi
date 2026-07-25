@@ -23,6 +23,7 @@ import openpi.policies.libero_policy as libero_policy
 from openpi.policies import yam_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
+import openpi.training.augment as _augment
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
 import openpi.training.misc.polaris_config as polaris_config
 import openpi.training.misc.roboarena_config as roboarena_config
@@ -63,6 +64,28 @@ class AssetsConfig:
 
 
 @dataclasses.dataclass(frozen=True)
+class MixtureSource:
+    """One dataset in a stratified fixed-count mixture (see `DataConfig.mixture`).
+
+    `samples_per_batch` is a hard per-batch count, not a probability: every batch
+    contains exactly this many samples from this dataset, so the gradient share of
+    a source equals `samples_per_batch / batch_size` exactly. The counts across all
+    sources must sum to the training batch size.
+    """
+
+    # LeRobot repo id for this source.
+    repo_id: str
+    # Exact number of samples this source contributes to every batch.
+    samples_per_batch: int
+    # Optional local dataset root. If None, LeRobot resolves $HF_LEROBOT_HOME/<repo_id>.
+    root: str | None = None
+    # Fraction of this source's episodes to withhold from training (validation split).
+    # Selection is deterministic given `holdout_seed`; see `select_holdout_episodes`.
+    holdout_fraction: float = 0.0
+    holdout_seed: int = 0
+
+
+@dataclasses.dataclass(frozen=True)
 class DataConfig:
     # LeRobot repo id. If None, fake data will be created.
     repo_id: str | None = None
@@ -80,8 +103,19 @@ class DataConfig:
     data_transforms: _transforms.Group = dataclasses.field(default_factory=_transforms.Group)
     # Model specific transforms. Will be applied after the data is normalized.
     model_transforms: _transforms.Group = dataclasses.field(default_factory=_transforms.Group)
+    # Transforms applied ONLY by the training data loader -- not by the policy/inference
+    # chain and not by compute_norm_stats. This is where image augmentation lives, so it
+    # is off at eval/serving by construction. Applied after `data_transforms.inputs` and
+    # before normalization.
+    train_only_transforms: _transforms.Group = dataclasses.field(default_factory=_transforms.Group)
     # If true, will use quantile normalization. Otherwise, normal z-score normalization will be used.
     use_quantile_norm: bool = False
+
+    # If non-empty, the data loader samples from several LeRobot datasets with a fixed
+    # per-batch count per source instead of from the single `repo_id`. All sources must
+    # share the same feature schema (the repack/data transforms are applied to all of
+    # them). `repo_id`/`asset_id` still determine where norm stats are read from.
+    mixture: Sequence[MixtureSource] = ()
 
     # Names of keys that will be used by the data loader to generate the action sequence. The length of the
     # sequence is defined by the `action_horizon` field in the model config. This should be adjusted if your
@@ -487,6 +521,36 @@ class LeRobotYamDataConfig(DataConfigFactory):  # noqa: F821  (DataConfigFactory
 
 
 @dataclasses.dataclass(frozen=True)
+class LeRobotYamMixtureDataConfig(LeRobotYamDataConfig):
+    """YAM data config that samples from several LeRobot datasets at a fixed ratio.
+
+    Used for the teleop-oversampling experiment: the two source datasets are stored
+    at ~33% teleop / 67% ego by frames, but training draws a fixed number of samples
+    per source per batch (e.g. 32/32), so teleop's gradient share is set explicitly
+    and independently of how much of it there is on disk. There is deliberately no
+    per-source loss weighting -- sampling is the single lever.
+
+    All sources share this config's repack/data transforms, so they must share a
+    feature schema (same camera keys, same state/action layout, same fps).
+    """
+
+    # The mixture. `samples_per_batch` across all sources must equal TrainConfig.batch_size.
+    sources: tyro.conf.Suppress[Sequence[MixtureSource]] = ()
+    # Training-time image augmentation. Set to None to disable.
+    augment_config: tyro.conf.Suppress[_augment.ImageAugmentConfig | None] = dataclasses.field(
+        default_factory=_augment.ImageAugmentConfig
+    )
+
+    @override
+    def create(self, assets_dirs, model_config):
+        config = super().create(assets_dirs, model_config)
+        train_only = _transforms.Group()
+        if self.augment_config is not None:
+            train_only = _transforms.Group(inputs=[_augment.ImageAugment(self.augment_config)])
+        return dataclasses.replace(config, mixture=tuple(self.sources), train_only_transforms=train_only)
+
+
+@dataclasses.dataclass(frozen=True)
 class LeRobotDROIDDataConfig(DataConfigFactory):
     """
     Example data config for custom DROID dataset in LeRobot format.
@@ -704,6 +768,87 @@ _CONFIGS = [
         ).get_freeze_filter(),
         ema_decay=None,
     ),
+    #
+    # ---- Teleop-oversampling co-fine-tune (E-A / E-B / E-C) ----
+    #
+    # Two source datasets, stored at ~33% teleop / 67% ego by frames:
+    #   teleop: angkul07/abc-teleop                              ~540k frames  (~5h, real robot)
+    #   ego:    angkul07/EgoDex-PickPlace-YAM-14dof-multiview   ~1080k frames (~10h, retargeted)
+    # Training draws a FIXED number of samples per source per batch, so teleop's
+    # gradient share is set explicitly (p_teleop) rather than inherited from the
+    # storage ratio. No per-source loss weighting -- sampling is the only lever.
+    #
+    # Epoch math (B=64, S=steps, p=p_teleop):
+    #   teleop epochs = p*B*S/540k ; ego epochs = (1-p)*B*S/1080k
+    #   E-A: 3.0 / 1.5   E-B: 3.7 / 1.1   E-C: 5.9 / 3.0
+    #
+    # GOTCHAS carried over from the 7k run:
+    #   * decay_steps MUST equal num_train_steps (openpi defaults it to 30k).
+    #   * norm stats are per-ratio, computed through the SAME sampler:
+    #       uv run scripts/compute_norm_stats.py --config-name <name> \
+    #           --max-frames 200000 --skip-videos
+    #     Raw-storage stats would be ego-dominated and would misnormalize the teleop
+    #     grippers this experiment prioritizes.
+    #   * These are fresh runs from pi0_fast_base, NOT resumes of the 7k checkpoint
+    #     (a resume would drag along its exhausted cosine schedule and old norm stats).
+    *[
+        TrainConfig(
+            name=name,
+            model=pi0_fast.Pi0FASTConfig(
+                action_dim=14, action_horizon=50, max_token_len=300,
+                paligemma_variant="gemma_2b_lora",
+            ),
+            data=LeRobotYamMixtureDataConfig(
+                # repo_id is the "primary" source; norm stats live under assets/<config>/<asset_id>.
+                repo_id="angkul07/abc-teleop",
+                assets=AssetsConfig(asset_id=asset_id),
+                # Required: the repack transform forwards "prompt", and pi0-FAST's
+                # tokenizer raises "Prompt is required" without it.
+                base_config=DataConfig(prompt_from_task=True),
+                sources=(
+                    MixtureSource(
+                        repo_id="angkul07/abc-teleop",
+                        samples_per_batch=teleop_per_batch,
+                        # Validation split: withheld from training so the offline eval
+                        # (fidelity-sdk `HoldoutSpec("teleop:0.1", seed=0)`) scores on
+                        # episodes the policy has never seen. Set to 0.0 to train on all.
+                        holdout_fraction=0.1,
+                        holdout_seed=0,
+                    ),
+                    MixtureSource(
+                        repo_id="angkul07/EgoDex-PickPlace-YAM-14dof-multiview",
+                        samples_per_batch=64 - teleop_per_batch,
+                        # No ego holdout: headline metrics are teleop-only by design.
+                    ),
+                ),
+            ),
+            weight_loader=weight_loaders.CheckpointWeightLoader(
+                "gs://openpi-assets/checkpoints/pi0_fast_base/params"
+            ),
+            num_train_steps=num_steps,
+            # Peak LR unchanged from the 7k run: it was stable there (grad_norm ~2.5),
+            # and the failure mode was too few steps, not a bad optimizer config.
+            lr_schedule=_optimizer.CosineDecaySchedule(
+                warmup_steps=warmup_steps, peak_lr=3.5e-5, decay_steps=num_steps, decay_lr=3.5e-6
+            ),
+            batch_size=64,
+            num_workers=8,
+            save_interval=save_interval,
+            freeze_filter=pi0_fast.Pi0FASTConfig(
+                action_dim=14, action_horizon=50, max_token_len=300,
+                paligemma_variant="gemma_2b_lora",
+            ).get_freeze_filter(),
+            ema_decay=None,
+        )
+        for name, asset_id, teleop_per_batch, num_steps, warmup_steps, save_interval in [
+            # E-A: baseline ratio, matched to the previous 50/50 experiment.
+            ("pi0_fast_yam_mix_ea", "yam_mix_p50", 32, 50_000, 1_000, 5_000),
+            # E-B: teleop-biased arm (62.5% gradient share on the higher-quality source).
+            ("pi0_fast_yam_mix_eb", "yam_mix_p625", 40, 50_000, 1_000, 5_000),
+            # E-C: long run at the safe ratio, aligned with the official recipe length.
+            ("pi0_fast_yam_mix_ec", "yam_mix_p50", 32, 100_000, 2_000, 10_000),
+        ]
+    ],
     #
     # Inference DROID configs.
     #
