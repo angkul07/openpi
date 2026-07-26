@@ -6,6 +6,7 @@ import dataclasses
 import difflib
 import json
 import logging
+import os
 import pathlib
 from typing import Any, Literal, Protocol, TypeAlias
 
@@ -548,6 +549,15 @@ def _load_teleop_holdout() -> tuple[int, ...]:
 
 _TELEOP_HOLDOUT_EPISODES = _load_teleop_holdout()
 
+# Roots for the pre-selected 7h mixture, built by vast_run/select_mixture.py +
+# vast_run/build_mixture.py. These are standalone LeRobot v2.1 datasets renumbered
+# 0..N-1, not views onto the full sources, so no index-based exclusion applies to them:
+#   teleop  761 eps / 251,703 frames / 2.331 h   (holdout already physically removed)
+#   ego   4,174 eps / 505,837 frames / 4.684 h   (min 30 episodes per object)
+# Override with YAM7H_TELEOP_ROOT / YAM7H_EGO_ROOT if the box lays them out elsewhere.
+_TELEOP_7H_ROOT = os.environ.get("YAM7H_TELEOP_ROOT", "/workspace/data/yam7h/teleop")
+_EGO_7H_ROOT = os.environ.get("YAM7H_EGO_ROOT", "/workspace/data/yam7h/ego")
+
 
 @dataclasses.dataclass(frozen=True)
 class LeRobotYamMixtureDataConfig(LeRobotYamDataConfig):
@@ -814,6 +824,27 @@ _CONFIGS = [
     #   teleop epochs = p*B*S/540k ; ego epochs = (1-p)*B*S/1080k
     #   E-A: 3.0 / 1.5   E-B: 3.7 / 1.1   E-C: 5.9 / 3.0
     #
+    # ---- yam7h_* arms: same experiment on the 7h mixture ----
+    #
+    # Same two upstreams, pre-selected down to 7.014 h and stored locally:
+    #   teleop  251,703 frames (2.331 h)   ego  505,837 frames (4.684 h)
+    # Storage is 33/67 here, but the fixed 32/32 draw means the gradient share is 50/50
+    # regardless -- the ratio is set by sampling, never by how much is on disk.
+    #
+    # Step counts come from holding the ORIGINAL epoch budget, not from scaling steps by
+    # the hours removed. The 15h E-A ran 3.0 teleop / 1.5 ego epochs; keeping that on 7h:
+    #   S = 3.0 * 251,703 / 32 = 23,597 -> 23,600, which also lands ego at exactly 1.5.
+    # E-B holds the SAME 23,600 steps rather than recomputing from its 40/24 split: the
+    # arms must differ in mixing ratio alone, so giving them unequal optimization budgets
+    # would confound the comparison. (E-B therefore runs 3.75 teleop / 0.9 ego epochs,
+    # exactly as the 15h E-B ran 3.7 / 1.1.) E-C stays the long arm at 2x E-A.
+    # Warmup is ~2% of steps throughout, matching 1000/50k on the 15h arms.
+    #
+    # Deliberately UNCHANGED from the 15h arms: peak LR 3.5e-5, batch 64, LoRA variant,
+    # EMA disabled. The previous run was undertrained, not misoptimized -- grad norms were
+    # stable -- so only schedule-length-dependent knobs move. Changing LR or batch size at
+    # the same time as dataset scale would make the result unattributable.
+    #
     # GOTCHAS carried over from the 7k run:
     #   * decay_steps MUST equal num_train_steps (openpi defaults it to 30k).
     #   * norm stats are per-ratio, computed through the SAME sampler:
@@ -821,6 +852,12 @@ _CONFIGS = [
     #           --max-frames 200000 --skip-videos
     #     Raw-storage stats would be ego-dominated and would misnormalize the teleop
     #     grippers this experiment prioritizes.
+    #   * The 7h arms need their OWN norm stats -- hence asset_id yam7h_* rather than
+    #     yam_mix_*. The mixture ratio is unchanged but the underlying distribution is
+    #     not: ego dropped 160 low-count objects and teleop is a different 761-episode
+    #     sample, so the q01/q99 quantiles move. Reusing yam_mix_p50 would silently
+    #     normalize against the 15h distribution, and run_yam.sh skips stat computation
+    #     whenever the file already exists.
     #   * These are fresh runs from pi0_fast_base, NOT resumes of the 7k checkpoint
     #     (a resume would drag along its exhausted cosine schedule and old norm stats).
     *[
@@ -843,13 +880,24 @@ _CONFIGS = [
                     MixtureSource(
                         repo_id="angkul07/abc-teleop",
                         samples_per_batch=teleop_per_batch,
+                        # None for the full-dataset arms (resolves $HF_LEROBOT_HOME/<repo_id>);
+                        # a local path for the pre-selected 7h arms.
+                        root=teleop_root,
                         # Withheld for offline eval; also what makes training storage 30/70.
                         # Nothing moves on disk -- these episodes are simply never sampled.
-                        exclude_episodes=_TELEOP_HOLDOUT_EPISODES,
+                        #
+                        # EMPTY for the 7h arms, and it must stay empty: those indices are
+                        # ORIGINAL abc-teleop indices, but the 7h dataset is a renumbered
+                        # 0..760 subset that already physically excludes the holdout. Reusing
+                        # them there would be wrong twice over -- 143 of the 249 fall outside
+                        # 0..760 (which raises), and the other 106 are in range and would
+                        # silently withhold completely unrelated episodes.
+                        exclude_episodes=exclude_teleop,
                     ),
                     MixtureSource(
                         repo_id="angkul07/EgoDex-PickPlace-YAM-14dof-multiview",
                         samples_per_batch=64 - teleop_per_batch,
+                        root=ego_root,
                         # No ego holdout: headline metrics are teleop-only by design.
                     ),
                 ),
@@ -878,13 +926,27 @@ _CONFIGS = [
             ).get_freeze_filter(),
             ema_decay=None,
         )
-        for name, asset_id, teleop_per_batch, num_steps, warmup_steps in [
+        for (
+            name,
+            asset_id,
+            teleop_per_batch,
+            num_steps,
+            warmup_steps,
+            teleop_root,
+            ego_root,
+            exclude_teleop,
+        ) in [
+            # ---- 15h arms: full abc-teleop + full ego, holdout excluded by index ----
             # E-A: baseline ratio, matched to the previous 50/50 experiment.
-            ("pi0_fast_yam_mix_ea", "yam_mix_p50", 32, 50_000, 1_000),
+            ("pi0_fast_yam_mix_ea", "yam_mix_p50", 32, 50_000, 1_000, None, None, _TELEOP_HOLDOUT_EPISODES),
             # E-B: teleop-biased arm (62.5% gradient share on the higher-quality source).
-            ("pi0_fast_yam_mix_eb", "yam_mix_p625", 40, 50_000, 1_000),
+            ("pi0_fast_yam_mix_eb", "yam_mix_p625", 40, 50_000, 1_000, None, None, _TELEOP_HOLDOUT_EPISODES),
             # E-C: long run at the safe ratio, aligned with the official recipe length.
-            ("pi0_fast_yam_mix_ec", "yam_mix_p50", 32, 100_000, 2_000),
+            ("pi0_fast_yam_mix_ec", "yam_mix_p50", 32, 100_000, 2_000, None, None, _TELEOP_HOLDOUT_EPISODES),
+            # ---- 7h arms: pre-selected local subsets, holdout already physically absent ----
+            ("pi0_fast_yam7h_ea", "yam7h_p50", 32, 23_600, 500, _TELEOP_7H_ROOT, _EGO_7H_ROOT, ()),
+            ("pi0_fast_yam7h_eb", "yam7h_p625", 40, 23_600, 500, _TELEOP_7H_ROOT, _EGO_7H_ROOT, ()),
+            ("pi0_fast_yam7h_ec", "yam7h_p50", 32, 47_200, 950, _TELEOP_7H_ROOT, _EGO_7H_ROOT, ()),
         ]
     ],
     #

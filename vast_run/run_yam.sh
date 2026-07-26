@@ -1,19 +1,30 @@
 #!/bin/bash
 # YAM pi0-fast teleop-oversampling co-fine-tune on 2x A100-80GB. Run inside tmux.
 #
+# 15h mixture (full datasets from $HF_LEROBOT_HOME):
 #   ./vast_run/run_yam.sh                        # E-A  (p_teleop=0.50, 50k steps)
 #   ./vast_run/run_yam.sh pi0_fast_yam_mix_eb    # E-B  (p_teleop=0.625, 50k steps)
 #   ./vast_run/run_yam.sh pi0_fast_yam_mix_ec    # E-C  (p_teleop=0.50, 100k steps)
 #
+# 7h mixture (pre-selected local subsets under /workspace/data/yam7h):
+#   ./vast_run/run_yam.sh pi0_fast_yam7h_ea      # E-A  (p_teleop=0.50, 23.6k steps)
+#   ./vast_run/run_yam.sh pi0_fast_yam7h_eb      # E-B  (p_teleop=0.625, 23.6k steps)
+#   ./vast_run/run_yam.sh pi0_fast_yam7h_ec      # E-C  (p_teleop=0.50, 47.2k steps)
+#
 # Prereqs on the box:
-#   uv run vast_run/dl.py                        # both datasets -> $HF_LEROBOT_HOME
+#   uv run vast_run/dl.py                        # 15h arms only: datasets -> $HF_LEROBOT_HOME
+#                                                # 7h arms ship their own data; nothing to download
 #   uv run vast_run/preflight_checks.py          # BLOCKING gripper-convention check
 #   export WANDB_API_KEY=...                     # or put it in vast_run/env.local
 set -o pipefail
 cd /workspace/openpi || exit 1
 
 CONFIG="${1:-pi0_fast_yam_mix_ea}"
-EXP_NAME="${2:-${CONFIG#pi0_fast_yam_mix_}}"
+# Strip whichever family prefix matches so EXP_NAME is just the arm ("ea"), keeping
+# checkpoints at checkpoints/<config>/<arm>/ for both families.
+_ARM="${CONFIG#pi0_fast_yam_mix_}"
+_ARM="${_ARM#pi0_fast_yam7h_}"
+EXP_NAME="${2:-$_ARM}"
 
 # Logs, all under /workspace/logs/<config>/:
 #   pipeline.log     everything this script prints (also on the tmux pane)
