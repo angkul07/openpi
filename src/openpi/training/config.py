@@ -949,6 +949,133 @@ _CONFIGS = [
             ("pi0_fast_yam7h_ec", "yam7h_p50", 32, 47_200, 950, _TELEOP_7H_ROOT, _EGO_7H_ROOT, ()),
         ]
     ],
+    # ---- pi05_yam7h_* arms: the same 7h mixture under pi0.5 (flow matching) ----
+    #
+    # Deltas from the pi0_fast_yam7h_* block above, and the reason for each:
+    #
+    #   action_dim 14 -> 32  (NOT OPTIONAL)
+    #     pi05_base ships action_in_proj as Linear(32, 1024) and action_out_proj as
+    #     Linear(1024, 32). _merge_params() in training/weight_loaders.py matches on
+    #     KEY NAMES ONLY and never compares shapes, so action_dim=14 does not raise at
+    #     load time -- it fails later inside jit with an error that points nowhere near
+    #     the cause. Nothing downstream cares: YamOutputs already slices [..., :14] and
+    #     PadStatesAndActions zero-pads 14 -> 32.
+    #
+    #     Note this affects the ACTIONS only. With pi05=True, embed_suffix never emits
+    #     a state token, so the padded 32-dim `state` array is carried for the type
+    #     spec and never read by the model.
+    #
+    #   max_token_len 300 -> 200
+    #     300 existed to hold FAST action tokens. pi0.5 has none -- actions go to the
+    #     flow expert as continuous conditioning and never enter the token stream.
+    #     The prompt is "Task: {task}, State: {ints};\nAction: ", and TokenizePrompt
+    #     runs BEFORE PadStatesAndActions in ModelTransformFactory, so it tokenizes the
+    #     real 14 state values, not 32 padded ones. ~90 tokens in practice.
+    #     Confirm on your own task strings with vast_run/pi05/pi05_preflight.py.
+    #
+    #   discrete_state_input: deliberately NOT SET.
+    #     Pi0Config.__post_init__ defaults it to `pi05`, i.e. True. Do NOT copy
+    #     discrete_state_input=False from pi05_libero: with pi05=True the state token
+    #     is already absent from the suffix, so False means the model receives NO
+    #     proprioception at all.
+    #
+    #   action expert is full-rank and trainable.
+    #     get_freeze_filter() with paligemma_variant="gemma_2b_lora" freezes ".*llm.*"
+    #     EXCEPT the "_1"-suffixed action-expert params and EXCEPT lora. Trainable set
+    #     grows ~448M (SigLIP + rank-16 LoRA) -> ~759M (+311M expert), roughly +4 GB of
+    #     AdamW state per GPU under --fsdp-devices 1.
+    #     SigLIP is trainable in BOTH families -- the freeze regex is ".*llm.*" and
+    #     SigLIP lives at PaliGemma.img, not PaliGemma.llm.
+    #     If grad_norm runs hot in the first 500 steps, the conservative fallback is
+    #     action_expert_variant="gemma_300m_lora" (rank 32), which puts the trainable
+    #     set back at ~459M. Set it on BOTH the model and the freeze_filter.
+    #
+    #   norm stats are REUSED from the pi0-FAST arms -- do not recompute.
+    #     compute_norm_stats.py applies repack + data_transforms only (never
+    #     model_transforms), and DataConfig.use_quantile_norm is
+    #     `model_type != ModelType.PI0`, which is True for PI0_FAST and PI05 alike.
+    #     Identical 14-dim quantile stats. Copy the directory per arm:
+    #       cp -r assets/pi0_fast_yam7h_ea/yam7h_p50  assets/pi05_yam7h_ea/
+    #       cp -r assets/pi0_fast_yam7h_eb/yam7h_p625 assets/pi05_yam7h_eb/
+    #       cp -r assets/pi0_fast_yam7h_ec/yam7h_p50  assets/pi05_yam7h_ec/
+    #     run_yam.sh stage [1/3] then skips recomputation on its own.
+    #
+    #   Held fixed on purpose, so the only moving part is the architecture:
+    #     batch 64, 23,600 steps (3.00 teleop / 1.49 ego epochs), warmup 500,
+    #     cosine 3.5e-5 -> 3.5e-6, ema off, clip_gradient_norm 1.0 (AdamW default,
+    #     already matches pi05_libero).
+    #     For reference, openpi's own pi0.5 recipes (pi05_libero,
+    #     pi05_full_droid_finetune) use 5e-5 HELD CONSTANT -- decay_lr == peak_lr, no
+    #     cosine. That is a legitimate alternative, but adopting it here would confound
+    #     the architecture comparison. If you do switch, run_yam.sh's
+    #     `decay_steps == num_train_steps` assert still holds; just set decay_lr=5e-5.
+    #
+    #   Checkpoints are ~25-30% larger than pi0-FAST (+311M expert params and their
+    #   optimizer state). Drop max_to_keep to 2 if the checkpoint volume is tight.
+    *[
+        TrainConfig(
+            name=name,
+            model=pi0_config.Pi0Config(
+                pi05=True,
+                action_dim=32,
+                action_horizon=50,
+                max_token_len=200,
+                paligemma_variant="gemma_2b_lora",
+            ),
+            data=LeRobotYamMixtureDataConfig(
+                # repo_id is the "primary" source; norm stats live under assets/<config>/<asset_id>.
+                repo_id="angkul07/abc-teleop",
+                assets=AssetsConfig(asset_id=asset_id),
+                # Still required: the repack transform forwards "prompt", and
+                # PaligemmaTokenizer needs it. TokenizePrompt raises without it.
+                base_config=DataConfig(prompt_from_task=True),
+                sources=(
+                    MixtureSource(
+                        repo_id="angkul07/abc-teleop",
+                        samples_per_batch=teleop_per_batch,
+                        root=_TELEOP_7H_ROOT,
+                        # MUST stay empty, same as the pi0-FAST 7h arms: the 7h teleop
+                        # set is a renumbered 0..760 subset that already physically
+                        # excludes the holdout. _TELEOP_HOLDOUT_EPISODES holds ORIGINAL
+                        # abc-teleop indices and would be wrong twice over here.
+                        exclude_episodes=(),
+                    ),
+                    MixtureSource(
+                        repo_id="angkul07/EgoDex-PickPlace-YAM-14dof-multiview",
+                        samples_per_batch=64 - teleop_per_batch,
+                        root=_EGO_7H_ROOT,
+                        # No ego holdout: headline metrics are teleop-only by design.
+                    ),
+                ),
+            ),
+            weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+            num_train_steps=num_steps,
+            lr_schedule=_optimizer.CosineDecaySchedule(
+                warmup_steps=warmup_steps, peak_lr=3.5e-5, decay_steps=num_steps, decay_lr=3.5e-6
+            ),
+            batch_size=64,
+            num_workers=8,
+            save_interval=1_000,
+            max_to_keep=4,
+            keep_period=None,
+            freeze_filter=pi0_config.Pi0Config(
+                pi05=True,
+                action_dim=32,
+                action_horizon=50,
+                max_token_len=200,
+                paligemma_variant="gemma_2b_lora",
+            ).get_freeze_filter(),
+            ema_decay=None,
+        )
+        for (name, asset_id, teleop_per_batch, num_steps, warmup_steps) in [
+            # E-A: baseline ratio, direct counterpart to pi0_fast_yam7h_ea.
+            ("pi05_yam7h_ea", "yam7h_p50", 32, 23_600, 500),
+            # E-B: teleop-biased arm (62.5% gradient share on the higher-quality source).
+            ("pi05_yam7h_eb", "yam7h_p625", 40, 23_600, 500),
+            # E-C: 2x length at the baseline ratio.
+            ("pi05_yam7h_ec", "yam7h_p50", 32, 47_200, 950),
+        ]
+    ],
     #
     # Inference DROID configs.
     #

@@ -3,6 +3,7 @@
 Usage:
     uv run vast_run/upload_ckpt.py                          # E-A run
     uv run vast_run/upload_ckpt.py --config pi0_fast_yam_mix_eb --exp-name eb
+    uv run vast_run/upload_ckpt.py --config pi05_yam7h_ea    # pi0.5 arm
     uv run vast_run/upload_ckpt.py --step 25000             # one checkpoint only
 """
 
@@ -18,7 +19,15 @@ ap.add_argument("--step", default=None, help="upload only this checkpoint step")
 ap.add_argument("--repo-id", default=None, help="defaults to angkul07/<config>")
 args = ap.parse_args()
 
-exp_name = args.exp_name or args.config.replace("pi0_fast_yam_mix_", "")
+# Strip whichever family prefix matches so the default exp_name is the bare arm
+# ("ea"), matching run_yam.sh's checkpoints/<config>/<arm>/ layout for every family.
+exp_name = args.exp_name
+if exp_name is None:
+    exp_name = args.config
+    for _prefix in ("pi0_fast_yam_mix_", "pi0_fast_yam7h_", "pi05_yam7h_"):
+        if exp_name.startswith(_prefix):
+            exp_name = exp_name[len(_prefix) :]
+            break
 repo_id = args.repo_id or f"angkul07/{args.config.replace('_', '-')}"
 folder = pathlib.Path("/workspace/openpi/checkpoints") / args.config / exp_name
 path_in_repo = None

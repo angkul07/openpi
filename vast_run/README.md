@@ -24,10 +24,92 @@ lerobot looking for a migration path.
 | `pi0_fast_yam_mix_ea` | 0.50 | 32 / 32 | 50,000 | 1,000 |
 | `pi0_fast_yam_mix_eb` | 0.625 | 40 / 24 | 50,000 | 1,000 |
 | `pi0_fast_yam_mix_ec` | 0.50 | 32 / 32 | 100,000 | 2,000 |
+| `pi0_fast_yam7h_ea` | 0.50 | 32 / 32 | 23,600 | 500 |
+| `pi0_fast_yam7h_eb` | 0.625 | 40 / 24 | 23,600 | 500 |
+| `pi0_fast_yam7h_ec` | 0.50 | 32 / 32 | 47,200 | 950 |
+| `pi05_yam7h_ea` | 0.50 | 32 / 32 | 23,600 | 500 |
+| `pi05_yam7h_eb` | 0.625 | 40 / 24 | 23,600 | 500 |
+| `pi05_yam7h_ec` | 0.50 | 32 / 32 | 47,200 | 950 |
 
 Everything else matches the previous 7k run: LoRA `gemma_2b_lora`, batch 64,
 peak LR 3.5e-5 → 3.5e-6 cosine (decay_steps == num_train_steps), bf16, EMA off,
 QUANTILES norm, delta joints + absolute grippers.
+
+## pi0.5 arms
+
+`pi05_yam7h_*` runs the **same 7h mixture, same schedule, same data transforms**
+against `Pi0Config(pi05=True)` — flow matching instead of FAST action tokens. The
+data config is byte-identical to its `pi0_fast_yam7h_*` twin, so the only moving
+part is the architecture. Four deltas, three of which are traps rather than tuning:
+
+| | pi0-FAST | pi0.5 |
+| --- | --- | --- |
+| `action_dim` | 14 | **32** |
+| `max_token_len` | 300 | **200** |
+| `pi05` | — | **True** |
+| `discrete_state_input` | — | **leave unset** (defaults to `pi05`, i.e. True) |
+| weight loader | `pi0_fast_base` | **`pi05_base`** |
+
+- **`action_dim=32` is mandatory.** `weight_loaders._merge_params` matches on key
+  names and never compares shapes, so 14 does *not* raise at load — it dies later
+  inside jit pointing somewhere unrelated. `YamOutputs` already slices `[..., :14]`
+  and `PadStatesAndActions` zero-pads 14 → 32, so nothing downstream cares.
+- **Do not copy `discrete_state_input=False` from `pi05_libero`.** With `pi05=True`
+  `embed_suffix` emits no state token, so `False` means the model gets *no*
+  proprioception at all — the discretized prompt is the only path in.
+- **`max_token_len=200` is enough** because `TokenizePrompt` runs *before*
+  `PadStatesAndActions` in `ModelTransformFactory`, so it tokenizes the real 14
+  state values, not 32 padded ones (~90 tokens in practice).
+- **The YAM-specific FAST tokenizer is dead here.** π0.5 uses `PaligemmaTokenizer`
+  for text only; `Pi0Config` has no `fast_model_tokenizer` field.
+
+**Norm stats carry over unchanged — copy, don't recompute.**
+`compute_norm_stats.py` applies `repack + data_transforms` only (never
+`model_transforms`), and `use_quantile_norm` is `model_type != PI0`, which is True
+for `PI0_FAST` and `PI05` alike. Identical 14-dim quantile stats:
+
+```bash
+mkdir -p assets/pi05_yam7h_ea assets/pi05_yam7h_eb assets/pi05_yam7h_ec
+cp -r assets/pi0_fast_yam7h_ea/yam7h_p50  assets/pi05_yam7h_ea/
+cp -r assets/pi0_fast_yam7h_eb/yam7h_p625 assets/pi05_yam7h_eb/
+cp -r assets/pi0_fast_yam7h_ec/yam7h_p50  assets/pi05_yam7h_ec/
+```
+
+Stage `[1/3]` then prints "already present" and skips. If it starts computing, you
+skipped the copy — not fatal, just ~10 wasted minutes.
+
+**Two pi0.5-only tools, both under `vast_run/pi05/`:**
+
+```bash
+# BLOCKING (exit 2 = do not launch): config shape, trainable split,
+# prompt length on real task strings, norm-stat presence/shape
+uv run vast_run/pi05/pi05_preflight.py pi05_yam7h_ea
+
+# Read this BEFORE committing GPU-hours: per-source tracking residual,
+# normalized action distribution, clip atoms, gripper mode collision
+uv run vast_run/pi05/mixture_diagnostics.py \
+  --norm-stats assets/pi05_yam7h_ea/yam7h_p50/norm_stats.json
+```
+
+**Cost and memory.** Per-step FLOPs are ~0.95–1.05× the pi0-FAST arm (shorter
+prefix; the 50 action tokens go through the 311M expert at width 1024 instead of
+the 2B trunk). Take the measured s/step from
+`checkpoints/pi0_fast_yam7h_ea/ea/train_metrics.log` and multiply by ~1.0. The
+action expert trains full-rank, so the trainable set goes ~448M → ~759M (+~4 GB of
+AdamW state per GPU under `--fsdp-devices 1`) and checkpoints grow ~25–30% — drop
+`max_to_keep` to 2 if the checkpoint volume is tight. If GPU utilization sits under
+~85% you are dataloader-bound on three-camera video decode, in which case the
+architecture change costs nothing and `num_workers` is the real lever.
+
+**Reading the loss curve.** `compute_loss` averages squared error over all 32
+action dims, 18 of which are zero-padding where the target is recoverable as
+`x_t / t`. The sharp drop in the first few hundred steps is mostly those dims, not
+the task. Watch `grad_norm` over the first 500 steps against the ~2.5 seen on
+pi0-FAST; if it runs hot, the fallback is `action_expert_variant="gemma_300m_lora"`
+(rank 32) set on **both** the model and the `freeze_filter`.
+
+W&B project defaults to `pi05-yam` for these arms (`pi0-fast-modal` otherwise);
+override with `WANDB_PROJECT=...`.
 
 ## Multi-GPU and resume
 
@@ -86,6 +168,10 @@ tmux new -s train './vast_run/run_yam.sh pi0_fast_yam_mix_ea'
 # 4. push checkpoints
 uv run vast_run/upload_ckpt.py --config pi0_fast_yam_mix_ea
 ```
+
+For a `pi05_yam7h_*` arm, insert the norm-stat copy and the two pi0.5 checks from
+the section above between steps 2 and 3; steps 3 and 4 are otherwise unchanged
+(`run_yam.sh` and `upload_ckpt.py` both handle the prefix).
 
 ## Things that will bite you
 
