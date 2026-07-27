@@ -981,9 +981,14 @@ _CONFIGS = [
     #
     #   action expert is full-rank and trainable.
     #     get_freeze_filter() with paligemma_variant="gemma_2b_lora" freezes ".*llm.*"
-    #     EXCEPT the "_1"-suffixed action-expert params and EXCEPT lora. Trainable set
-    #     grows ~448M (SigLIP + rank-16 LoRA) -> ~759M (+311M expert), roughly +4 GB of
-    #     AdamW state per GPU under --fsdp-devices 1.
+    #     EXCEPT the "_1"-suffixed action-expert params and EXCEPT lora.
+    #     MEASURED on this config via jax.eval_shape (vast_run/pi05/pi05_preflight.py),
+    #     not estimated: trainable 872.8M = action expert 427.9M + SigLIP 414.8M +
+    #     LoRA 27.9M + action/time projections 2.2M; frozen Gemma 2B trunk 2508.5M.
+    #     That is ~10.5 GB/GPU of AdamW moments + grads under --fsdp-devices 1
+    #     (12 bytes/param), against ~5.4 GB for the pi0-FAST arms' ~448M.
+    #     NOTE the expert is 427.9M, not the 311M quoted for gemma_300m -- the "300m"
+    #     name counts the transformer stack only.
     #     SigLIP is trainable in BOTH families -- the freeze regex is ".*llm.*" and
     #     SigLIP lives at PaliGemma.img, not PaliGemma.llm.
     #     If grad_norm runs hot in the first 500 steps, the conservative fallback is

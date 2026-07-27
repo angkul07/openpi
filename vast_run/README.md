@@ -95,9 +95,13 @@ uv run vast_run/pi05/mixture_diagnostics.py \
 prefix; the 50 action tokens go through the 311M expert at width 1024 instead of
 the 2B trunk). Take the measured s/step from
 `checkpoints/pi0_fast_yam7h_ea/ea/train_metrics.log` and multiply by ~1.0. The
-action expert trains full-rank, so the trainable set goes ~448M → ~759M (+~4 GB of
-AdamW state per GPU under `--fsdp-devices 1`) and checkpoints grow ~25–30% — drop
-`max_to_keep` to 2 if the checkpoint volume is tight.
+action expert trains full-rank, so the trainable set goes ~448M → **872.8M** and
+checkpoints grow ~25–30% — drop `max_to_keep` to 2 if the checkpoint volume is
+tight. Measured breakdown from `pi05_preflight.py` (`jax.eval_shape`, not an
+estimate): action expert 427.9M + SigLIP 414.8M + LoRA 27.9M + projections 2.2M
+trainable, Gemma 2B trunk 2508.5M frozen, ≈10.5 GB/GPU of AdamW moments and grads
+under `--fsdp-devices 1`. Note the expert is 427.9M, not the 311M the
+`gemma_300m` name suggests — that name counts the transformer stack only.
 
 **The pi0.5 arms run `num_workers=16`, not the 8 the pi0-FAST arms use.** Since
 pi0.5's per-step GPU cost is ~0.95–1.05× pi0-FAST's, a loader that was already the
