@@ -87,51 +87,78 @@ def pool(root: pathlib.Path, n: int) -> dict[str, np.ndarray]:
     return {c: np.concatenate(v) for c, v in acc.items()}
 
 
+def modes(x: np.ndarray) -> tuple[float, float]:
+    """Closed/open mode medians, split at the MIDRANGE.
+
+    Not at the median: teleop's gripper is ~88% open, so a median split lands inside
+    the open mode and reports "closed" as ~0.98. mixture_diagnostics.py splits at
+    0.5*(p1+p99) and this must agree with it, or the before/after numbers are lies.
+    """
+    lo, hi = np.percentile(x, [1, 99])
+    mid = 0.5 * (lo + hi)
+    low, high = x[x <= mid], x[x > mid]
+    return (
+        float(np.median(low)) if low.size else float(lo),
+        float(np.median(high)) if high.size else float(hi),
+    )
+
+
 def fit(teleop: dict, ego: dict, lo_q: float, hi_q: float) -> dict:
-    """Per (column, dim) affine a*x+b mapping ego's [lo_q,hi_q] onto teleop's, plus clip bounds."""
+    """Per (column, dim) monotone piecewise-linear map, ego -> teleop.
+
+    Knots are [min, closed_mode, open_mode, max]. An AFFINE map cannot do this job:
+    ego's gripper is a continuous aperture (modes ~0.22/0.41 inside [0.02, 0.86])
+    while teleop's is near-binary (~0.05/0.99). Anchoring an affine on p1/p99 aligns
+    the ranges but leaves the modes ~0.8 apart -- still mode-averaging territory --
+    and anchoring it on the modes implies gain ~5 and saturates over half the frames.
+    Piecewise-linear pins BOTH modes AND both extremes, so it closes the gap exactly,
+    stays monotone (aperture ordering within ego is preserved), needs no clipping,
+    and keeps grasp transitions continuous instead of binarizing them.
+    """
     plan = {}
     for col in COLUMNS:
         for dim in GRIPPER_DIMS:
             t, e = teleop[col][:, dim], ego[col][:, dim]
-            t_lo, t_hi = np.percentile(t, [lo_q, hi_q])
-            e_lo, e_hi = np.percentile(e, [lo_q, hi_q])
-            if e_hi - e_lo < 1e-9:
-                raise SystemExit(f"{col} dim {dim}: ego range is degenerate, refusing to fit")
-            a = (t_hi - t_lo) / (e_hi - e_lo)
-            b = t_lo - a * e_lo
-            mapped = a * e + b
-            clip_lo, clip_hi = float(t.min()), float(t.max())
+            # Robust extremes so a single outlier frame cannot set a knot.
+            t_min, t_max = np.percentile(t, [lo_q * 0.1, 100 - (100 - hi_q) * 0.1])
+            e_min, e_max = np.percentile(e, [lo_q * 0.1, 100 - (100 - hi_q) * 0.1])
+            t_closed, t_open = modes(t)
+            e_closed, e_open = modes(e)
+
+            xk = [float(e_min), float(e_closed), float(e_open), float(e_max)]
+            yk = [float(t_min), float(t_closed), float(t_open), float(t_max)]
+            if not all(xk[i] < xk[i + 1] for i in range(3)):
+                raise SystemExit(f"{col} dim {dim}: ego knots not strictly increasing: {xk}")
+            if not all(yk[i] < yk[i + 1] for i in range(3)):
+                raise SystemExit(f"{col} dim {dim}: teleop knots not strictly increasing: {yk}")
+
+            mapped = np.interp(e, xk, yk)
+            m_closed, m_open = modes(mapped)
             plan[f"{col}:{dim}"] = {
-                "column": col,
-                "dim": dim,
-                "name": DIM_NAMES[dim],
-                "a": float(a),
-                "b": float(b),
-                "clip_lo": clip_lo,
-                "clip_hi": clip_hi,
-                "teleop_anchor": [float(t_lo), float(t_hi)],
-                "ego_anchor": [float(e_lo), float(e_hi)],
-                "frac_clipped": float(np.mean((mapped < clip_lo) | (mapped > clip_hi))),
-                "ego_closed_before": float(np.median(e[e <= np.median(e)])),
-                "ego_open_before": float(np.median(e[e > np.median(e)])),
+                "column": col, "dim": dim, "name": DIM_NAMES[dim],
+                "x_knots": xk, "y_knots": yk,
+                "ego_closed_before": e_closed, "ego_open_before": e_open,
+                "ego_closed_after": m_closed, "ego_open_after": m_open,
+                "teleop_closed": t_closed, "teleop_open": t_open,
+                # np.interp clamps outside the knot range, so this is the saturated share.
+                "frac_saturated": float(np.mean((e < xk[0]) | (e > xk[-1]))),
             }
-            m = np.clip(mapped, clip_lo, clip_hi)
-            plan[f"{col}:{dim}"]["ego_closed_after"] = float(np.median(m[m <= np.median(m)]))
-            plan[f"{col}:{dim}"]["ego_open_after"] = float(np.median(m[m > np.median(m)]))
-            plan[f"{col}:{dim}"]["teleop_closed"] = float(np.median(t[t <= np.median(t)]))
-            plan[f"{col}:{dim}"]["teleop_open"] = float(np.median(t[t > np.median(t)]))
     return plan
 
 
 def print_plan(plan: dict, lo_q: float, hi_q: float) -> None:
-    print(f"\n=== MAPPING (anchors: ego p{lo_q:g}/p{hi_q:g} -> teleop p{lo_q:g}/p{hi_q:g}) ===")
+    print(f"\n=== MAPPING (monotone piecewise-linear; extremes at p{lo_q * 0.1:g}/"
+          f"p{100 - (100 - hi_q) * 0.1:g}, plus both modes) ===")
     for key in sorted(plan):
         p = plan[key]
-        print(f"  {p['column']:18s} {p['name']:7s}  x -> {p['a']:.4f}*x {p['b']:+.4f}   "
-              f"clip[{p['clip_lo']:.3f},{p['clip_hi']:.3f}]  clipped={p['frac_clipped']:.2%}")
-        print(f"      ego closed {p['ego_closed_before']:.3f} -> {p['ego_closed_after']:.3f}  "
-              f"(teleop {p['teleop_closed']:.3f})")
-        print(f"      ego open   {p['ego_open_before']:.3f} -> {p['ego_open_after']:.3f}  "
+        xs = ", ".join(f"{v:.3f}" for v in p["x_knots"])
+        ys = ", ".join(f"{v:.3f}" for v in p["y_knots"])
+        print(f"  {p['column']:18s} {p['name']:7s}  saturated={p['frac_saturated']:.2%}")
+        print(f"      ego  [{xs}]")
+        print(f"      ->   [{ys}]")
+        print(f"      closed {p['ego_closed_before']:.3f} -> {p['ego_closed_after']:.3f} "
+              f"(teleop {p['teleop_closed']:.3f})   "
+              f"open {p['ego_open_before']:.3f} -> {p['ego_open_after']:.3f} "
               f"(teleop {p['teleop_open']:.3f})")
 
 
@@ -161,7 +188,9 @@ def apply(ego_root: pathlib.Path, plan: dict, lo_q: float, hi_q: float) -> None:
             backup[f"{rel}|{col}"] = arr[:, list(GRIPPER_DIMS)].astype(np.float32)
             for dim in GRIPPER_DIMS:
                 p = plan[f"{col}:{dim}"]
-                arr[:, dim] = np.clip(p["a"] * arr[:, dim] + p["b"], p["clip_lo"], p["clip_hi"])
+                # np.interp clamps outside the knot range, which is the intended
+                # saturation at the physical gripper limits.
+                arr[:, dim] = np.interp(arr[:, dim], p["x_knots"], p["y_knots"])
             table = rebuild_column(table, col, arr)
             changed = True
         if changed:
