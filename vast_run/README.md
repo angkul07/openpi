@@ -135,10 +135,10 @@ ratio is **14.8**. Ego contributes no corrective signal at all.
 perfectly recoverable from the prompt alone — a more direct shortcut than the
 wrist-blur one, and it is not addressed by image augmentation.
 
-**Cost and memory.** Per-step FLOPs are ~0.95–1.05× the pi0-FAST arm (shorter
-prefix; the 50 action tokens go through the 311M expert at width 1024 instead of
-the 2B trunk). Take the measured s/step from
-`checkpoints/pi0_fast_yam7h_ea/ea/train_metrics.log` and multiply by ~1.0. The
+**Cost and memory.** MEASURED on 2× A100-80GB at batch 64: **3.53 s/step**, i.e.
+**~23.1 h for 23,600 steps** (E-A / E-B) and **~46 h for 47,200** (E-C). Budget the
+instance rental against 23 h — the pre-run estimate of 15–19 h was optimistic. GPU
+utilization is 95%, so this is compute-bound and loader tuning will not move it. The
 action expert trains full-rank, so the trainable set goes ~448M → **872.8M** and
 checkpoints grow ~25–30% — drop `max_to_keep` to 2 if the checkpoint volume is
 tight. Measured breakdown from `pi05_preflight.py` (`jax.eval_shape`, not an
@@ -147,14 +147,24 @@ trainable, Gemma 2B trunk 2508.5M frozen, ≈10.5 GB/GPU of AdamW moments and gr
 under `--fsdp-devices 1`. Note the expert is 427.9M, not the 311M the
 `gemma_300m` name suggests — that name counts the transformer stack only.
 
-**The pi0.5 arms run `num_workers=16`, not the 8 the pi0-FAST arms use.** Since
-pi0.5's per-step GPU cost is ~0.95–1.05× pi0-FAST's, a loader that was already the
-binding constraint would eat the entire architecture change — three-camera video
-decode is the known bottleneck. The knob does not touch the optimization (same
-batch, same steps, same sample order), so it cannot confound the comparison. If GPU
-utilization still sits under ~85% in the first few hundred steps, raise it again;
-watch RSS while you do, since each worker holds its own decode buffers
-(`persistent_workers=True`, torch's default `prefetch_factor=2`).
+**The pi0.5 arms run `num_workers=16`. Do not bother raising it — measured, this
+run is compute-bound, not loader-bound.** 200-step A/B on 2× A100-80GB, page cache
+pre-warmed so run order could not decide it, steady-state windows only (steps
+50–175, excluding XLA compile and loader spin-up):
+
+| `num_workers` | s/step | GPU util | 23.6k ETA |
+| --- | --- | --- | --- |
+| 16 | **3.528** | 95.0% | 23.1 h |
+| 32 | 3.545 | 94.7% | 23.2 h |
+
+Doubling workers made it **0.5% slower**, and the within-config window spread is
+0.7–0.9% — so the difference sits *below* the noise floor. At 95% GPU utilization
+there is no loader headroom left to reclaim; three-camera decode is comfortably
+keeping both GPUs fed. `param_norm` was bit-identical across the two runs at step
+175, confirming the knob does not perturb the optimization.
+
+Whether 8 would also suffice was not tested — 16 is known-sufficient and costs
+nothing, so it stays. The lever for speed here is GPUs or batch size, not workers.
 
 **Reading the loss curve.** `compute_loss` averages squared error over all 32
 action dims, 18 of which are zero-padding where the target is recoverable as
