@@ -89,7 +89,51 @@ uv run vast_run/pi05/pi05_preflight.py pi05_yam7h_ea
 # normalized action distribution, clip atoms, gripper mode collision
 uv run vast_run/pi05/mixture_diagnostics.py \
   --norm-stats assets/pi05_yam7h_ea/yam7h_p50/norm_stats.json
+
+# Ego gripper rescale -- REQUIRED before the first pi0.5 run on a fresh dataset.
+# Dry run first; --revert undoes it; a sentinel blocks double-application.
+uv run vast_run/pi05/rescale_ego_gripper.py            # dry run
+uv run vast_run/pi05/rescale_ego_gripper.py --apply
+rm -rf assets/pi05_yam7h_ea/yam7h_p50                  # stats are now stale
+uv run scripts/compute_norm_stats.py --config-name pi05_yam7h_ea \
+  --max-frames 200000 --skip-videos
 ```
+
+### What the diagnostics actually said on the 7h mixture
+
+Measured, not predicted — three of these contradict the original plan.
+
+**Gripper collision was real and is now fixed.** Before the rescale, ego's "open"
+sat *closer to teleop's closed* than to teleop's open:
+
+| | teleop open | ego open | gap | after fix |
+| --- | --- | --- | --- | --- |
+| `R_grip` | +0.984 | −0.114 | **1.10** | ego +0.689 → gap **0.295** |
+| `L_grip` | +0.986 | −0.216 | **1.20** | ego +0.819 → gap **0.167** |
+
+Both are now well under the 0.5 mode-averaging threshold and the diagnostic's
+warning no longer fires.
+
+**Ego's gradient share is HIGHER than its sampling share, not lower.** The original
+analysis predicted ego's narrow deltas would compress its targets toward zero and
+weaken its contribution. The opposite is true: median arm-dim std is **teleop 0.215
+vs ego 0.387**, so ego's normalized actions are ~1.8× *wider*, and ego clips past
+|x|>1 on 2.6–7.8% of values against teleop's ~0–4%. Read E-A vs E-B accordingly —
+`p_teleop=0.5` under-weights teleop in effective terms.
+
+**Clip atoms are a non-issue.** All 24 detected atoms land at |normalized| ≤ 0.29,
+so q01/q99 are *not* being set by the ±0.1/±0.2 retargeting clips. The script
+prints its generic "consider teleop-only stats" note whenever any atom exists —
+check the per-atom "inside range" verdicts before acting on it.
+
+**The two sources teach different functions, sharply.** Ego's tracking residual is
+exactly 0.000 on every dim (`action[t] ≡ state[t+1]`); teleop's median arm lead
+ratio is **14.8**. Ego contributes no corrective signal at all.
+
+**Prompt-level domain shortcut.** Teleop has **1** distinct task string; ego has
+**471**. Under π0.5 the prompt *is* the conditioning, so source identity is
+perfectly recoverable from the prompt alone — a more direct shortcut than the
+wrist-blur one, and it is not addressed by image augmentation.
 
 **Cost and memory.** Per-step FLOPs are ~0.95–1.05× the pi0-FAST arm (shorter
 prefix; the 50 action tokens go through the 311M expert at width 1024 instead of
