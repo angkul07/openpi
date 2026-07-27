@@ -1054,7 +1054,17 @@ _CONFIGS = [
                 warmup_steps=warmup_steps, peak_lr=3.5e-5, decay_steps=num_steps, decay_lr=3.5e-6
             ),
             batch_size=64,
-            num_workers=8,
+            # 16, not the 8 the pi0-FAST arms use. Three-camera video decode is the
+            # loader bottleneck, and pi0.5's per-step GPU cost is ~0.95-1.05x pi0-FAST's
+            # -- so if the loader was already the binding constraint, the architecture
+            # swap buys nothing until this is raised. The box has 128 cores and 503 GB
+            # RAM, so 16 workers is still far from saturating either.
+            # This knob does NOT touch the optimization: same batch, same steps, same
+            # sample order. It only changes how fast batches are produced, so it cannot
+            # confound the pi0-FAST comparison.
+            # Watch RAM in the first few hundred steps -- each worker holds its own
+            # decode buffers. If GPU util is still under ~85%, raise it again.
+            num_workers=16,
             save_interval=1_000,
             max_to_keep=4,
             keep_period=None,

@@ -97,9 +97,16 @@ the 2B trunk). Take the measured s/step from
 `checkpoints/pi0_fast_yam7h_ea/ea/train_metrics.log` and multiply by ~1.0. The
 action expert trains full-rank, so the trainable set goes ~448M → ~759M (+~4 GB of
 AdamW state per GPU under `--fsdp-devices 1`) and checkpoints grow ~25–30% — drop
-`max_to_keep` to 2 if the checkpoint volume is tight. If GPU utilization sits under
-~85% you are dataloader-bound on three-camera video decode, in which case the
-architecture change costs nothing and `num_workers` is the real lever.
+`max_to_keep` to 2 if the checkpoint volume is tight.
+
+**The pi0.5 arms run `num_workers=16`, not the 8 the pi0-FAST arms use.** Since
+pi0.5's per-step GPU cost is ~0.95–1.05× pi0-FAST's, a loader that was already the
+binding constraint would eat the entire architecture change — three-camera video
+decode is the known bottleneck. The knob does not touch the optimization (same
+batch, same steps, same sample order), so it cannot confound the comparison. If GPU
+utilization still sits under ~85% in the first few hundred steps, raise it again;
+watch RSS while you do, since each worker holds its own decode buffers
+(`persistent_workers=True`, torch's default `prefetch_factor=2`).
 
 **Reading the loss curve.** `compute_loss` averages squared error over all 32
 action dims, 18 of which are zero-padding where the target is recoverable as
