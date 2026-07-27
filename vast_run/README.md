@@ -135,10 +135,26 @@ ratio is **14.8**. Ego contributes no corrective signal at all.
 perfectly recoverable from the prompt alone — a more direct shortcut than the
 wrist-blur one, and it is not addressed by image augmentation.
 
-**Cost and memory.** MEASURED on 2× A100-80GB at batch 64: **3.53 s/step**, i.e.
-**~23.1 h for 23,600 steps** (E-A / E-B) and **~46 h for 47,200** (E-C). Budget the
-instance rental against 23 h — the pre-run estimate of 15–19 h was optimistic. GPU
-utilization is 95%, so this is compute-bound and loader tuning will not move it. The
+**Cost and memory.** MEASURED at batch 64, 200-step runs, page cache pre-warmed,
+steady-state windows only:
+
+| box | s/step | GPU util | GPU power | CPU cores used | 23.6k ETA |
+| --- | --- | --- | --- | --- | --- |
+| 2× A100-SXM4-80GB, NVLink, 128 cores | 3.528 | 95.0% | — (capped 275/400 W) | not measured | **23.1 h** |
+| 2× H100-PCIe-80GB, PXB, ~31-core quota | **2.178** | 89.5% | 315 W of 350 | **3.0 of 30.7** | **14.3 h** |
+
+**H100 PCIe is 1.62× faster** — not the 2.65× the FP32 TFLOPS ratio suggests, and at
+the low end of a bf16-tensor-based estimate. Two reasons it underperforms its specs:
+no NVLink (gradient all-reduce of 872.8M trainable params crosses a PCIe switch every
+step, and GPU util drops to 89.5% versus the A100's 95% despite far more compute), and
+XLA on Hopper without FP8 or retuned kernels does not reach Ampere-equivalent MFU.
+
+**The CPU quota is a non-issue, contrary to expectation.** A "32 of 128 CPU" vast
+listing looks alarming for three-camera video decode, but the loader consumes only
+**~3.0 cores of the 30.7 available** (p95 3.2). Note `nproc` reports 128 and
+`cpuset` reports 0-127 on such a box — both misleading. The real limit is
+`/sys/fs/cgroup/cpu.max`; check that, then check whether the workload actually
+needs it. Here it does not, by a factor of ten.
 action expert trains full-rank, so the trainable set goes ~448M → **872.8M** and
 checkpoints grow ~25–30% — drop `max_to_keep` to 2 if the checkpoint volume is
 tight. Measured breakdown from `pi05_preflight.py` (`jax.eval_shape`, not an
@@ -152,19 +168,22 @@ run is compute-bound, not loader-bound.** 200-step A/B on 2× A100-80GB, page ca
 pre-warmed so run order could not decide it, steady-state windows only (steps
 50–175, excluding XLA compile and loader spin-up):
 
-| `num_workers` | s/step | GPU util | 23.6k ETA |
-| --- | --- | --- | --- |
-| 16 | **3.528** | 95.0% | 23.1 h |
-| 32 | 3.545 | 94.7% | 23.2 h |
+| box | `num_workers` | s/step | GPU util | verdict |
+| --- | --- | --- | --- | --- |
+| 2× A100 | 16 | **3.528** | 95.0% | — |
+| 2× A100 | 32 | 3.545 | 94.7% | 0.5% *slower* |
+| 2× H100 | 16 | **2.178** | 89.5% | — |
+| 2× H100 | 32 | 2.174 | 84.1% | 0.2% faster |
 
-Doubling workers made it **0.5% slower**, and the within-config window spread is
-0.7–0.9% — so the difference sits *below* the noise floor. At 95% GPU utilization
-there is no loader headroom left to reclaim; three-camera decode is comfortably
-keeping both GPUs fed. `param_norm` was bit-identical across the two runs at step
-175, confirming the knob does not perturb the optimization.
+Both differences sit **below the noise floor** (within-config window spread is
+0.4–0.9%). Confirmed on two different GPU generations and two very different CPU
+allocations (128 cores vs a 30.7-core quota), so treat it as settled: worker count
+is not a lever for this workload. The loader uses ~3 cores; it is nowhere near
+binding. `param_norm` was bit-identical across the A100 pair at step 175,
+confirming the knob does not perturb the optimization.
 
-Whether 8 would also suffice was not tested — 16 is known-sufficient and costs
-nothing, so it stays. The lever for speed here is GPUs or batch size, not workers.
+16 stays because it is known-sufficient and free. 8 would very likely do as well —
+never tested, and not worth testing. The real levers are GPU and batch size.
 
 **Reading the loss curve.** `compute_loss` averages squared error over all 32
 action dims, 18 of which are zero-padding where the target is recoverable as
