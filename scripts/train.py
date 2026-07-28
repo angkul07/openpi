@@ -148,14 +148,18 @@ def train_step(
         model: _model.BaseModel, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions
     ):
         chunked_loss = model.compute_loss(rng, observation, actions, train=True)
-        return jnp.mean(chunked_loss)
+        # Carry the un-reduced loss out as aux so the caller can report its structure
+        # without a second forward pass.
+        return jnp.mean(chunked_loss), chunked_loss
 
     train_rng = jax.random.fold_in(rng, state.step)
     observation, actions = batch
 
     # Filter out frozen params.
     diff_state = nnx.DiffState(0, config.trainable_filter)
-    loss, grads = nnx.value_and_grad(loss_fn, argnums=diff_state)(model, train_rng, observation, actions)
+    (loss, chunked_loss), grads = nnx.value_and_grad(loss_fn, argnums=diff_state, has_aux=True)(
+        model, train_rng, observation, actions
+    )
 
     params = state.params.filter(config.trainable_filter)
     updates, new_opt_state = state.tx.update(grads, state.opt_state, params)
@@ -188,6 +192,23 @@ def train_step(
         "grad_norm": optax.global_norm(grads),
         "param_norm": optax.global_norm(kernel_params),
     }
+
+    # Flow-matching models (pi0 / pi0.5) return loss per action-chunk step, shape
+    # (*b, action_horizon): the mean squared error between the predicted velocity v_t
+    # and the target u_t = noise - actions. That IS the flow loss, so `flow_loss`
+    # equals `loss` -- it is logged under its own name so the objective is
+    # unambiguous next to the FAST arms, whose `loss` is token cross-entropy.
+    # pi0-FAST returns shape (*b,) and is skipped by the ndim guard (shapes are
+    # static under jit, so this branch is resolved at trace time).
+    if chunked_loss.ndim > 1:
+        # Mean over every batch axis, leaving one value per step in the chunk.
+        per_chunk_step = jnp.mean(chunked_loss, axis=tuple(range(chunked_loss.ndim - 1)))
+        info["flow_loss"] = loss
+        # Later actions in a chunk are predicted from the same observation and are
+        # consistently harder; a widening gap means chunk quality is degrading.
+        info["flow_loss_chunk_first"] = per_chunk_step[0]
+        info["flow_loss_chunk_last"] = per_chunk_step[-1]
+
     return new_state, info
 
 

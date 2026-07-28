@@ -32,6 +32,16 @@ class Pi0Config(_model.BaseModelConfig):
     # This config option is not used directly by the model, but it is read by the ModelTransformFactory.
     discrete_state_input: bool = None  # type: ignore
 
+    # openpi's BUILT-IN image augmentation, applied inside compute_loss via
+    # model.preprocess_observation(train=True): random crop 0.95 + resize +
+    # rotate (-5, 5) on non-wrist cameras, and ColorJitter(brightness=0.3,
+    # contrast=0.4, saturation=0.5) on every camera.
+    # This is separate from, and heavier than, the ImageAugmentConfig stack wired
+    # through DataConfig.train_only_transforms -- disabling one leaves the other
+    # running. Set False for a clean no-augmentation run.
+    # Defaults True so every pre-existing config keeps its exact behaviour.
+    image_augmentation: bool = True
+
     pytorch_compile_mode: str | None = "max-autotune"
 
     def __post_init__(self):
