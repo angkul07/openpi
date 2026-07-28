@@ -560,7 +560,7 @@ _EGO_7H_ROOT = os.environ.get("YAM7H_EGO_ROOT", "/workspace/data/yam7h/ego")
 
 # 100%-teleop single-source run: abc-ego `put_the_screwdriver_in_the_bin`, converted
 # from MCAP by vast_run/mcap_to_lerobot.py.
-# 2,234 episodes / 741,573 frames / 6.87 h at 30 fps.
+# 2,234 episodes / 730,496 frames / 6.76 h at 30 fps.
 _ABCEGO_SD_ROOT = os.environ.get("ABCEGO_SD_ROOT", "/workspace/abc-ego-lerobot")
 
 
@@ -1102,7 +1102,7 @@ _CONFIGS = [
     # ---- pi05_abcego_sd: 100% teleop, single source, exactly one epoch ----
     #
     # Source: angkul07/abc-ego `put_the_screwdriver_in_the_bin`, converted from MCAP by
-    # vast_run/mcap_to_lerobot.py. 2,234 episodes / 741,573 frames / 6.87 h at 30 fps.
+    # vast_run/mcap_to_lerobot.py. 2,234 episodes / 730,496 frames / 6.76 h at 30 fps.
     # Single task string, so `prompt` carries no discriminative signal -- expected for a
     # single-task finetune, but it does mean language is doing nothing here.
     #
@@ -1120,7 +1120,7 @@ _CONFIGS = [
     #          launcher outright.
     #     Sampling is unaffected: StratifiedBatchSampler with one source draws all 64
     #     indices from a random permutation of that source, reshuffled on wrap -- i.e.
-    #     ordinary shuffled training. Its batches_per_epoch is size // 64 = 11,587,
+    #     ordinary shuffled training. Its batches_per_epoch is size // 64 = 11,414,
     #     which is the same epoch this config's num_train_steps encodes.
     #
     #   The inherited repack already maps exactly the keys the converter emits
@@ -1144,19 +1144,19 @@ _CONFIGS = [
     #              --max-frames 200000 --skip-videos
     #     --skip-videos is safe and ~100x faster: the script reads only state/actions.
     #     --max-frames is REQUIRED on the mixture path and is what run_yam.sh already
-    #     passes; 200k of 741k frames is ample for stable q01/q99.
+    #     passes; 200k of 730k frames is ample for stable q01/q99.
     #
     #   num_train_steps = ONE epoch, and it is tied to batch_size.
-    #     741,573 frames / 64 = 11,587.1 -> 11,588 steps. len(LeRobotDataset) is the
+    #     730,496 frames / 64 = 11,414 exactly. len(LeRobotDataset) is the
     #     frame count (delta_timestamps clamps at episode ends rather than dropping
     #     samples), so epochs = steps * batch_size / total_frames. If you change
     #     batch_size, recompute BOTH num_train_steps and decay_steps or you silently
     #     change the epoch count. Verify against the real dataset after conversion:
     #       python -c "import json;i=json.load(open('/workspace/abc-ego-lerobot/meta/info.json'));\
     #                  print(i['total_frames'], -(-i['total_frames']//64))"
-    #     At other batch sizes one epoch is: 32 -> 23,175 | 48 -> 15,450 | 96 -> 7,725.
+    #     At other batch sizes one epoch is: 32 -> 22,828 | 48 -> 15,219 | 96 -> 7,610.
     #
-    #   warmup 500 is 4.3% of this run, against 2.1% of the 23.6k-step arms.
+    #   warmup 500 is 4.4% of this run, against 2.1% of the 23.6k-step arms.
     #     Fine for a cosine schedule; drop to 250 if the first 500 steps look wasted.
     #
     # batch_size 64 assumes 80GB-class hardware, as measured for the pi05_yam7h arms
@@ -1192,9 +1192,9 @@ _CONFIGS = [
             ),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        num_train_steps=11_588,
+        num_train_steps=11_414,
         lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=500, peak_lr=3.5e-5, decay_steps=11_588, decay_lr=3.5e-6
+            warmup_steps=500, peak_lr=3.5e-5, decay_steps=11_414, decay_lr=3.5e-6
         ),
         batch_size=64,
         num_workers=16,
@@ -1202,7 +1202,7 @@ _CONFIGS = [
         max_to_keep=4,
         # Pin every 5,000th checkpoint permanently, so steps 5,000 and 10,000 survive
         # the rolling max_to_keep=4 window instead of being deleted by later saves.
-        # Final checkpoints kept: the last 4 (8k/9k/10k/11k + the 11,587 end-of-run
+        # Final checkpoints kept: the last 4 (8k/9k/10k/11k + the 11,413 end-of-run
         # save) PLUS pinned 5,000. The pi05_yam7h_* arms use keep_period=None.
         keep_period=5_000,
         freeze_filter=pi0_config.Pi0Config(
