@@ -87,7 +87,11 @@ uv run vast_run/pi05/pi05_preflight.py pi05_yam7h_ea
 
 # Read this BEFORE committing GPU-hours: per-source tracking residual,
 # normalized action distribution, clip atoms, gripper mode collision
-uv run vast_run/pi05/mixture_diagnostics.py \
+# --episodes 40 is NOT optional if you want to reproduce the numbers below: the
+# sampler is deterministic but strided (files[::len/N][:N]), so a different N
+# reads a different episode subset. At the default 30 the L_grip gap reads 0.483
+# instead of 0.167 -- same data, same stats, different sample.
+uv run vast_run/pi05/mixture_diagnostics.py --episodes 40 \
   --norm-stats assets/pi05_yam7h_ea/yam7h_p50/norm_stats.json
 
 # Ego gripper rescale -- REQUIRED before the first pi0.5 run on a fresh dataset.
@@ -110,6 +114,11 @@ sat *closer to teleop's closed* than to teleop's open:
 | --- | --- | --- | --- | --- |
 | `R_grip` | +0.984 | −0.114 | **1.10** | ego +0.689 → gap **0.295** |
 | `L_grip` | +0.986 | −0.216 | **1.20** | ego +0.819 → gap **0.167** |
+
+All four post-fix figures reproduced to the digit on a second box (2x H100 SXM,
+dataset pulled fresh from the Hub rather than copied), and the norm stats
+recomputed there were bit-identical to the originals — max |delta| 0.00000 across
+mean/std/q01/q99 for both `state` and `actions`. The rescale is deterministic.
 
 Both are now well under the 0.5 mode-averaging threshold and the diagnostic's
 warning no longer fires.
