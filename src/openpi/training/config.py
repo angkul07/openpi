@@ -558,6 +558,11 @@ _TELEOP_HOLDOUT_EPISODES = _load_teleop_holdout()
 _TELEOP_7H_ROOT = os.environ.get("YAM7H_TELEOP_ROOT", "/workspace/data/yam7h/teleop")
 _EGO_7H_ROOT = os.environ.get("YAM7H_EGO_ROOT", "/workspace/data/yam7h/ego")
 
+# 100%-teleop single-source run: abc-ego `put_the_screwdriver_in_the_bin`, converted
+# from MCAP by vast_run/mcap_to_lerobot.py.
+# 2,234 episodes / 741,573 frames / 6.87 h at 30 fps.
+_ABCEGO_SD_ROOT = os.environ.get("ABCEGO_SD_ROOT", "/workspace/abc-ego-lerobot")
+
 
 @dataclasses.dataclass(frozen=True)
 class LeRobotYamMixtureDataConfig(LeRobotYamDataConfig):
@@ -1093,6 +1098,122 @@ _CONFIGS = [
             ("pi05_yam7h_ec", "yam7h_p50", 32, 47_200, 950),
         ]
     ],
+    #
+    # ---- pi05_abcego_sd: 100% teleop, single source, exactly one epoch ----
+    #
+    # Source: angkul07/abc-ego `put_the_screwdriver_in_the_bin`, converted from MCAP by
+    # vast_run/mcap_to_lerobot.py. 2,234 episodes / 741,573 frames / 6.87 h at 30 fps.
+    # Single task string, so `prompt` carries no discriminative signal -- expected for a
+    # single-task finetune, but it does mean language is doing nothing here.
+    #
+    # Differences from the pi05_yam7h_* arms above, and why:
+    #
+    #   A MIXTURE OF ONE, deliberately -- not LeRobotYamDataConfig.
+    #     100% teleop is one source, so the plain single-source config would be the
+    #     obvious choice. It is the wrong one here for two concrete reasons:
+    #       1. create_torch_dataset() hardcodes root=None on the non-mixture path, so
+    #          the dataset would have to live at $HF_LEROBOT_HOME/<repo_id> and be
+    #          symlinked into place. MixtureSource carries `root`, so the dataset stays
+    #          wherever the converter wrote it.
+    #       2. run_yam.sh stage [0] asserts `data.mixture` is non-empty and that
+    #          sum(samples_per_batch) == batch_size. A single-source config fails the
+    #          launcher outright.
+    #     Sampling is unaffected: StratifiedBatchSampler with one source draws all 64
+    #     indices from a random permutation of that source, reshuffled on wrap -- i.e.
+    #     ordinary shuffled training. Its batches_per_epoch is size // 64 = 11,587,
+    #     which is the same epoch this config's num_train_steps encodes.
+    #
+    #   The inherited repack already maps exactly the keys the converter emits
+    #   (observation.images.{top,left_wrist,right_wrist} / observation.state / action),
+    #   and the delta mask make_bool_mask(6, -1, 6, -1) matches the stored 14-D layout
+    #   [L j0-5, L grip, R j0-5, R grip]. Nothing to override.
+    #
+    #   use_delta_joint_actions stays True (the default).
+    #     The converter writes the raw teleop leader positions, i.e. ABSOLUTE actions.
+    #
+    #   exclude_episodes=() -- trains on 100% of the data, by request.
+    #     So there is NO held-out split and no honest offline eval. If you want a
+    #     number later, set holdout_fraction on the source (it is supported on this
+    #     path) or score against a separately converted set.
+    #
+    #   norm stats MUST be recomputed -- do NOT copy yam7h_*.
+    #     Different robot campaign, different joint distribution (rig A parks the left
+    #     arm entirely, rigs B/C do not), so the q01/q99 quantiles move. Reusing the 7h
+    #     stats would silently normalize against the wrong distribution:
+    #       uv run scripts/compute_norm_stats.py --config-name pi05_abcego_sd \
+    #              --max-frames 200000 --skip-videos
+    #     --skip-videos is safe and ~100x faster: the script reads only state/actions.
+    #     --max-frames is REQUIRED on the mixture path and is what run_yam.sh already
+    #     passes; 200k of 741k frames is ample for stable q01/q99.
+    #
+    #   num_train_steps = ONE epoch, and it is tied to batch_size.
+    #     741,573 frames / 64 = 11,587.1 -> 11,588 steps. len(LeRobotDataset) is the
+    #     frame count (delta_timestamps clamps at episode ends rather than dropping
+    #     samples), so epochs = steps * batch_size / total_frames. If you change
+    #     batch_size, recompute BOTH num_train_steps and decay_steps or you silently
+    #     change the epoch count. Verify against the real dataset after conversion:
+    #       python -c "import json;i=json.load(open('/workspace/abc-ego-lerobot/meta/info.json'));\
+    #                  print(i['total_frames'], -(-i['total_frames']//64))"
+    #     At other batch sizes one epoch is: 32 -> 23,175 | 48 -> 15,450 | 96 -> 7,725.
+    #
+    #   warmup 500 is 4.3% of this run, against 2.1% of the 23.6k-step arms.
+    #     Fine for a cosine schedule; drop to 250 if the first 500 steps look wasted.
+    #
+    # batch_size 64 assumes 80GB-class hardware, as measured for the pi05_yam7h arms
+    # (~10.5 GB/GPU of AdamW moments + grads for the 872.8M trainable set under
+    # --fsdp-devices 1). H100 SXM 80GB -- the intended target -- clears this with room
+    # to spare. Halve the batch and num_train_steps doubles to stay at one epoch.
+    TrainConfig(
+        name="pi05_abcego_sd",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=50,
+            max_token_len=200,
+            paligemma_variant="gemma_2b_lora",
+            image_augmentation=False,
+        ),
+        data=LeRobotYamMixtureDataConfig(
+            repo_id="angkul07/abc-ego-screwdriver",
+            assets=AssetsConfig(asset_id="abcego_sd"),
+            base_config=DataConfig(prompt_from_task=True),
+            # No augmentation on this run. This kills the ImageAugmentConfig stack
+            # (ColorJitter 0.15/0.15/0.10/0.03 on every camera + 0.95-1.0 area crop on
+            # the top camera) added for the 70/30 experiment. The model-side stack is
+            # killed separately by image_augmentation=False above -- BOTH are needed.
+            augment_config=None,
+            sources=(
+                MixtureSource(
+                    repo_id="angkul07/abc-ego-screwdriver",
+                    samples_per_batch=64,  # == batch_size: the only source
+                    root=_ABCEGO_SD_ROOT,
+                    exclude_episodes=(),
+                ),
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=11_588,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=500, peak_lr=3.5e-5, decay_steps=11_588, decay_lr=3.5e-6
+        ),
+        batch_size=64,
+        num_workers=16,
+        save_interval=1_000,
+        max_to_keep=4,
+        # Pin every 5,000th checkpoint permanently, so steps 5,000 and 10,000 survive
+        # the rolling max_to_keep=4 window instead of being deleted by later saves.
+        # Final checkpoints kept: the last 4 (8k/9k/10k/11k + the 11,587 end-of-run
+        # save) PLUS pinned 5,000. The pi05_yam7h_* arms use keep_period=None.
+        keep_period=5_000,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=50,
+            max_token_len=200,
+            paligemma_variant="gemma_2b_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+    ),
     #
     # Inference DROID configs.
     #

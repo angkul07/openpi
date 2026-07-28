@@ -38,6 +38,7 @@ CONFIG="${1:-pi0_fast_yam_mix_ea}"
 _ARM="${CONFIG#pi0_fast_yam_mix_}"
 _ARM="${_ARM#pi0_fast_yam7h_}"
 _ARM="${_ARM#pi05_yam7h_}"
+_ARM="${_ARM#pi05_abcego_}"
 EXP_NAME="${2:-$_ARM}"
 
 # W&B project, per family, so the pi0-FAST and pi0.5 runs do not land in one soup.
