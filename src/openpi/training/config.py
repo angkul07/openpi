@@ -563,6 +563,17 @@ _EGO_7H_ROOT = os.environ.get("YAM7H_EGO_ROOT", "/workspace/data/yam7h/ego")
 # 2,234 episodes / 730,496 frames / 6.76 h at 30 fps.
 _ABCEGO_SD_ROOT = os.environ.get("ABCEGO_SD_ROOT", "/workspace/abc-ego-lerobot")
 
+# 50/50 ego+teleop merge, pre-merged into ONE LeRobot v2.1 dataset rather than sampled
+# from two roots. 4,272 episodes / 755,964 frames / 7.00 h at 30 fps, 224x224.
+# Built by fd/sdk/lerobot_run/dataset/build_50run.py; the teleop half excludes every
+# episode in abc-teleop-holdout (249/249 matched by content hash, 0 leaks).
+# Published as angkul07/50_run_v21_fixed (private). Fetch and unpack with:
+#   hf download angkul07/50_run_v21_fixed 50_run_v21.tar --repo-type dataset --local-dir /workspace
+#   tar xf /workspace/50_run_v21.tar -C /workspace && mv /workspace/50_run_old /workspace/50_run
+# The tar unpacks to `50_run_old/` (its name on the build box); rename it or point
+# YAM50RUN_ROOT at it, otherwise stage [0] reports the dataset as missing.
+_50RUN_ROOT = os.environ.get("YAM50RUN_ROOT", "/workspace/50_run")
+
 
 @dataclasses.dataclass(frozen=True)
 class LeRobotYamMixtureDataConfig(LeRobotYamDataConfig):
@@ -1204,6 +1215,118 @@ _CONFIGS = [
         # the rolling max_to_keep=4 window instead of being deleted by later saves.
         # Final checkpoints kept: the last 4 (8k/9k/10k/11k + the 11,413 end-of-run
         # save) PLUS pinned 5,000. The pi05_yam7h_* arms use keep_period=None.
+        keep_period=5_000,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=50,
+            max_token_len=200,
+            paligemma_variant="gemma_2b_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+    ),
+    # ---- pi05_50run_ea: the 50/50 ego+teleop merge, single PRE-MERGED source ----
+    #
+    # This is the openpi counterpart of the LeRobot run in fd/sdk/lerobot_run
+    # (`run_yam_lerobot.sh pi05_50_ea`). Same data, same schedule, same trainable set --
+    # so the two are directly comparable, which is the point of having both.
+    #
+    # Source: angkul07/50_run_v21_fixed, LeRobot v2.1.
+    #   4,272 episodes / 755,964 frames / 7.00 h at 30 fps, 3 cameras at 224x224.
+    #   3.5 h of ego + 3.5 h of teleop, merged into ONE dataset at 50.00%/50.00% by
+    #   frames. The teleop half excludes every episode in abc-teleop-holdout
+    #   (249/249 matched by content hash, 0 leaks), so offline eval on that holdout
+    #   is honest.
+    #
+    # Differences from the pi05_yam7h_* arms above, and why:
+    #
+    #   THE RATIO LIVES IN STORAGE, not in the sampler.
+    #     The yam7h arms hold two roots and let MixtureSource draw a hard 32/32 every
+    #     batch. Here the 50/50 is already baked into one dataset, so a single source
+    #     drawing all 64 gives the same expected ratio. The difference is that it is
+    #     50/50 IN EXPECTATION -- Binomial(64, 0.5), sd ~4 samples/batch -- rather than
+    #     exact per batch. Fine in aggregate over 17.7k steps; it is also precisely the
+    #     constraint that forced the LeRobot port to merge in the first place, since
+    #     LeRobot has no per-source count. Keeping openpi on the merged dataset is what
+    #     makes the two runs comparable; use the yam7h arms if you want exact batches.
+    #
+    #   STILL a mixture-of-one, for the same two mechanical reasons as pi05_abcego_sd:
+    #     create_torch_dataset() hardcodes root=None off the mixture path, and
+    #     run_yam.sh stage [0] asserts data.mixture is non-empty.
+    #
+    #   NO AUGMENTATION, both stacks off -- matches the LeRobot run, which applied none.
+    #     augment_config=None kills the data-side ImageAugmentConfig; image_augmentation
+    #     =False kills the model-side stack. BOTH are needed, and leaving either on
+    #     would break comparability with the LeRobot numbers.
+    #
+    #   use_delta_joint_actions stays True (inherited default).
+    #     make_bool_mask(6, -1, 6, -1) = 6 joints delta + 1 gripper absolute, per arm.
+    #     This dataset is ordered [R j1-6, R grip, L j1-6, L grip] -- right arm FIRST,
+    #     unlike the abc-ego set's left-first layout. The mask is symmetric across the
+    #     two arms, so it is correct either way; only a mask with different per-arm
+    #     structure would care. This is openpi's positional equivalent of the LeRobot
+    #     side's `relative_exclude_joints=['gripper']`, which resolves BY NAME.
+    #
+    #   norm stats MUST be recomputed -- do NOT copy yam7h_* or abcego_*.
+    #     Different mixture, different distribution, so q01/q99 move:
+    #       uv run scripts/compute_norm_stats.py --config-name pi05_50run_ea \
+    #              --max-frames 200000 --skip-videos
+    #     run_yam.sh stage [1/3] does this for you. Quantile stats are computed AFTER
+    #     data_transforms, i.e. in DELTA space -- the same space the LeRobot run
+    #     normalised in, so the two are on equal footing.
+    #
+    #   num_train_steps = 17,700, tied to batch_size, and it is NOT a round epoch.
+    #     One epoch = 755,964 / 64 = 11,812 steps. 17,700 x 64 = 1,132,800 frame-visits
+    #     = 1.4985 epochs. Carried over verbatim from the LeRobot run so the two match;
+    #     use 17,718 if you want exactly 1.5. Change batch_size and you MUST recompute
+    #     num_train_steps AND decay_steps together (stage [0] asserts they are equal).
+    #     At other batch sizes 1.5 epochs is: 32 -> 35,436 | 96 -> 11,812 | 128 -> 8,859.
+    #
+    #   warmup 350 is 2.0% of the run, matching the yam7h arms' 500/23,600.
+    #
+    # batch_size 64 with --fsdp-devices 1 = pure data parallel, 32/GPU. Measured on
+    # 2x RTX PRO 6000 Blackwell (96 GB) under the PyTorch LeRobot port: 32.6 GB/GPU at
+    # 32/GPU, so 80 GB-class hardware clears this comfortably. Note openpi is JAX/XLA
+    # here versus eager PyTorch there, so step time will NOT match the 4.49 s/step
+    # measured on the LeRobot side; only the recipe is shared.
+    TrainConfig(
+        name="pi05_50run_ea",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=50,
+            max_token_len=200,
+            paligemma_variant="gemma_2b_lora",
+            image_augmentation=False,
+        ),
+        data=LeRobotYamMixtureDataConfig(
+            repo_id="angkul07/50_run_v21_fixed",
+            assets=AssetsConfig(asset_id="yam50run"),
+            base_config=DataConfig(prompt_from_task=True),
+            augment_config=None,
+            sources=(
+                MixtureSource(
+                    repo_id="angkul07/50_run_v21_fixed",
+                    samples_per_batch=64,  # == batch_size: the only source
+                    root=_50RUN_ROOT,
+                    # Holdout is already physically absent from this dataset (it was
+                    # excluded at build time), so nothing to withhold here.
+                    exclude_episodes=(),
+                ),
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=17_700,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=350, peak_lr=3.5e-5, decay_steps=17_700, decay_lr=3.5e-6
+        ),
+        batch_size=64,
+        num_workers=16,
+        # 1,500 matches the LeRobot run's save_freq. 11 saves over 17.7k steps; at
+        # ~15-25 GB each that is 165-275 GB if you keep them all, which is why
+        # max_to_keep is set. Bump max_to_keep only if the box has the disk.
+        save_interval=1_500,
+        max_to_keep=4,
         keep_period=5_000,
         freeze_filter=pi0_config.Pi0Config(
             pi05=True,

@@ -17,18 +17,38 @@
 #   ./vast_run/run_yam.sh pi05_yam7h_eb          # E-B  (p_teleop=0.625, 23.6k steps)
 #   ./vast_run/run_yam.sh pi05_yam7h_ec          # E-C  (p_teleop=0.50, 47.2k steps)
 #
+# 7h PRE-MERGED 50/50, pi0.5 -- the openpi counterpart of the LeRobot run:
+#   ./vast_run/run_yam.sh pi05_50run_ea          # 50/50 by storage, 17.7k steps
+#
+#   One dataset, not two roots: the 50/50 is baked into storage, so the sampler draws
+#   all 64 from it. Fetch it first (~2.5 GB, private repo -- needs `hf auth login`):
+#     hf download angkul07/50_run_v21_fixed 50_run_v21.tar \
+#        --repo-type dataset --local-dir /workspace
+#     tar xf /workspace/50_run_v21.tar -C /workspace
+#     mv /workspace/50_run_old /workspace/50_run      # tar unpacks under its build name
+#   Point YAM50RUN_ROOT elsewhere if you keep it off /workspace/50_run.
+#   It is LeRobot v2.1 on purpose -- stage [0] refuses anything this lerobot rev does
+#   not expect, and will NOT migrate a v3.0 tree in place.
+#
 # Prereqs on the box:
 #   uv run vast_run/dl.py                        # 15h arms only: datasets -> $HF_LEROBOT_HOME
 #                                                # 7h arms ship their own data; nothing to download
+#                                                # pi05_50run_ea: see the tar fetch above
 #   uv run vast_run/preflight_checks.py          # BLOCKING gripper-convention check
 #   uv run vast_run/pi05/pi05_preflight.py pi05_yam7h_ea   # pi0.5 arms only, see below
 #   export WANDB_API_KEY=...                     # or put it in vast_run/env.local
 #
-# pi0.5 arms: norm stats are IDENTICAL to the matching pi0-FAST arm (quantile stats are
-# computed after data_transforms and before model_transforms, and use_quantile_norm is
-# True for both PI0_FAST and PI05). Copy them across and stage [1/3] is a no-op:
+# pi05_yam7h_* arms: norm stats are IDENTICAL to the matching pi0-FAST arm (quantile
+# stats are computed after data_transforms and before model_transforms, and
+# use_quantile_norm is True for both PI0_FAST and PI05). Copy them across and stage
+# [1/3] is a no-op:
 #   mkdir -p assets/pi05_yam7h_ea
 #   cp -r assets/pi0_fast_yam7h_ea/yam7h_p50 assets/pi05_yam7h_ea/
+#
+# This does NOT apply to pi05_abcego_sd or pi05_50run_ea: neither has a pi0-FAST
+# counterpart, and both draw a different distribution, so their stats must actually be
+# computed. Expect stage [1/3] to run for ~10 min on those. Copying yam7h_* stats onto
+# them would silently normalise against the wrong distribution.
 set -o pipefail
 cd /workspace/openpi || exit 1
 
@@ -39,6 +59,7 @@ _ARM="${CONFIG#pi0_fast_yam_mix_}"
 _ARM="${_ARM#pi0_fast_yam7h_}"
 _ARM="${_ARM#pi05_yam7h_}"
 _ARM="${_ARM#pi05_abcego_}"
+_ARM="${_ARM#pi05_50run_}"
 EXP_NAME="${2:-$_ARM}"
 
 # W&B project, per family, so the pi0-FAST and pi0.5 runs do not land in one soup.
@@ -157,9 +178,11 @@ echo "===== [1/3] norm stats over the SAMPLED mixture $(date -u) ====="
 # Computed through the same fixed-ratio sampler as training: raw-storage stats
 # would be ego-dominated (33/67) and would misnormalize the teleop grippers.
 #
-# For a pi05_* arm this stage should print "already present" -- the stats are
+# For a pi05_yam7h_* arm this stage should print "already present" -- the stats are
 # byte-identical to the matching pi0_fast arm and you copied them in. If it starts
 # computing, you skipped the copy; that is not fatal, just 10 wasted minutes.
+# For pi05_abcego_sd / pi05_50run_ea there is nothing to copy: computing here is the
+# CORRECT behaviour, not a sign you missed a step.
 if [ -s "$NORM_DIR/norm_stats.json" ]; then
   echo "norm stats already present at $NORM_DIR -- skipping"
 else
