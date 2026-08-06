@@ -558,6 +558,17 @@ _TELEOP_HOLDOUT_EPISODES = _load_teleop_holdout()
 _TELEOP_7H_ROOT = os.environ.get("YAM7H_TELEOP_ROOT", "/workspace/data/yam7h/teleop")
 _EGO_7H_ROOT = os.environ.get("YAM7H_EGO_ROOT", "/workspace/data/yam7h/ego")
 
+# Roots for the 10/90 mixture: the same 7.014 h total re-split so teleop is 10% of the
+# frames instead of 33%. Same builders (vast_run/select_mixture.py + build_mixture.py),
+# same renumbered-0..N-1 standalone layout, so no index-based exclusion applies here either.
+#   teleop   75,754 frames (0.701 h,  ~229 eps)  -- a subset of the 7h teleop selection
+#   ego     681,786 frames (6.313 h, ~5,626 eps) -- LARGER than the 7h ego selection
+# NOTE the ego side cannot be carved out of _EGO_7H_ROOT: that root holds only 505,837
+# frames, so select_mixture.py must re-run against the full upstream (~1,080k frames
+# available) with a lower min-episodes-per-object than the 30 used for the 7h build.
+_TELEOP_1090_ROOT = os.environ.get("YAM1090_TELEOP_ROOT", "/workspace/data/yam1090/teleop")
+_EGO_1090_ROOT = os.environ.get("YAM1090_EGO_ROOT", "/workspace/data/yam1090/ego")
+
 # 100%-teleop single-source run: abc-ego `put_the_screwdriver_in_the_bin`, converted
 # from MCAP by vast_run/mcap_to_lerobot.py.
 # 2,234 episodes / 730,496 frames / 6.76 h at 30 fps.
@@ -1109,6 +1120,136 @@ _CONFIGS = [
             ("pi05_yam7h_ec", "yam7h_p50", 32, 47_200, 950),
         ]
     ],
+    #
+    # ---- pi05_yam1090_ea: the 10/90 arm -- same 7h, teleop cut to 10% of the frames ----
+    #
+    # Fourth point on the mixture-ratio sweep. Storage teleop share across the series:
+    #   100 % (pi05_abcego_sd)  ->  50 % (pi05_50run_ea)  ->  33 % (pi05_yam7h_ea)  ->  10 % (here)
+    # Total hours are held at 7.014 h throughout; only the split moves.
+    #
+    #   teleop   75,754 frames (0.701 h,  ~229 eps)   10.0 % of stored frames
+    #   ego     681,786 frames (6.313 h, ~5,626 eps)  90.0 %
+    #   total   757,540 frames (7.014 h @ 30 fps)     same total as the yam7h arms
+    #
+    # DRAW 24/40 (teleop gradient share 37.5 %), 32,000 steps at batch 64:
+    #
+    #                              teleop        ego
+    #   samples per batch              24         40
+    #   gradient share             37.5 %     62.5 %
+    #   frames seen over run      768,000  1,280,000
+    #   hours-equivalent seen       7.11 h    11.85 h
+    #   effective epochs             10.14       1.88
+    #   oversample vs storage       3.75x      0.69x
+    #   per-frame exposure ratio: each teleop frame is drawn 5.40x as often as each ego frame
+    #
+    # WHY 24/40 AND NOT 32/32. Three different quantities all get called "oversampling"
+    # here and they do NOT move together once the pools are 9.0x apart in size -- the
+    # yam7h arms hid this because their pools were only 2.0x apart. Spelled out so the
+    # next reader does not re-derive it:
+    #   1. gradient share vs storage share -- 37.5 % drawn vs 10.0 % stored = 3.75x.
+    #   2. per-frame revisit rate (== the epoch ratio) -- 10.14 / 1.88 = 5.40x.
+    #   3. TOTAL presentations over the run = samples_per_batch ratio, 24:40, i.e. ego is
+    #      still seen 1.67x more often in absolute terms. Steps cancel out of this one:
+    #      it is fixed by the draw alone and no step count can change it.
+    # Teleop is oversampled on (1) and (2) and remains the minority on (3). Getting
+    # teleop to parity on (3) needs a 32/32 draw, which at this split costs 18.0 teleop
+    # epochs to hold ego at 2.0 (42,600 steps). 24/40 was chosen as the point that buys a
+    # 3.75x oversample and ~1.9 ego epochs for 10.1 teleop epochs and 32k steps.
+    #
+    # The break-even draw is 6.4/57.6 -- that is 10 % of 64, i.e. proportional sampling.
+    # ANY draw above 6 teleop samples oversamples teleop on measures (1) and (2).
+    #
+    # Deltas from pi05_yam7h_ea, and the reason for each:
+    #
+    #   samples_per_batch 32/32 -> 24/40, and steps 23,600 -> 32,000.
+    #     Steps are NOT held at 23,600 here, unlike the E-A/E-B pair. That rule existed to
+    #     keep two arms of the SAME experiment differing in ratio alone; this is a
+    #     different mixture, and at 40 ego samples 23,600 steps would leave ego at 1.39
+    #     epochs. 32,000 puts ego at 1.88, close to yam7h_ea's 1.49, so ego exposure stays
+    #     roughly comparable across the two mixtures and the teleop volume is the variable.
+    #
+    #   warmup 500 -> 700 (2.19 % of 32,000, matching the ~2.1 % used throughout).
+    #
+    #   asset_id yam1090_p375 -- FRESH NORM STATS, do not copy yam7h_* or reuse p50.
+    #     Both the ratio and the underlying distribution moved: teleop is a ~229-episode
+    #     subsample and ego gained ~176k frames from objects the 30-episode-minimum filter
+    #     had excluded, so the q01/q99 quantiles shift on both sides. Stats are computed
+    #     through the SAME sampler, so the 24/40 draw is baked into them:
+    #       uv run scripts/compute_norm_stats.py --config-name pi05_yam1090_ea \
+    #           --max-frames 200000 --skip-videos
+    #     run_yam.sh stage [1/3] skips computation whenever the file already exists, so a
+    #     stray copied directory would silently normalize against the wrong distribution.
+    #
+    #   keep_period 5_000 (the yam7h arms use None).
+    #     At 10.14 teleop epochs overfitting is the failure mode to watch, and
+    #     max_to_keep=4 with save_interval=1_000 retains only a 4,000-step rolling window
+    #     -- every early checkpoint would be gone before it could be scored. Pinning
+    #     5k/10k/.../30k lets the overfit knee be located after the fact. Set to None if
+    #     checkpoint volume is tight (each is ~13 GB).
+    #
+    # Augmentation: ON, inherited unchanged from LeRobotYamMixtureDataConfig's default
+    # (augment_config -> ImageAugmentConfig), same as every yam7h arm. It applies via
+    # train_only_transforms, so it is off at eval by construction. Worth knowing before
+    # reading the loss curve: it augments IMAGES ONLY. The state and action streams repeat
+    # verbatim on all ~10 teleop revisits, so it blunts visual memorization, not action
+    # memorization -- which is the other reason keep_period is set above.
+    #
+    # Held fixed on purpose so the mixture is the only moving part: batch 64, peak LR
+    # 3.5e-5 -> 3.5e-6 cosine, EMA off, gemma_2b_lora, action_dim 32, max_token_len 200,
+    # num_workers 16. Fresh finetune from pi05_base, not a resume of any yam7h checkpoint.
+    #
+    # Cost: ~12.3 h on 2x H100 SXM, extrapolated from the 1.388 s/step measured on
+    # pi05_50run_ea at the same batch size, architecture and camera count.
+    TrainConfig(
+        name="pi05_yam1090_ea",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=50,
+            max_token_len=200,
+            paligemma_variant="gemma_2b_lora",
+        ),
+        data=LeRobotYamMixtureDataConfig(
+            repo_id="angkul07/abc-teleop",
+            assets=AssetsConfig(asset_id="yam1090_p375"),
+            base_config=DataConfig(prompt_from_task=True),
+            sources=(
+                MixtureSource(
+                    repo_id="angkul07/abc-teleop",
+                    samples_per_batch=24,
+                    root=_TELEOP_1090_ROOT,
+                    # Empty for the same reason as the 7h arms: this root is a renumbered
+                    # 0..228 subset that already physically excludes the holdout, while
+                    # _TELEOP_HOLDOUT_EPISODES holds ORIGINAL abc-teleop indices.
+                    exclude_episodes=(),
+                ),
+                MixtureSource(
+                    repo_id="angkul07/EgoDex-PickPlace-YAM-14dof-multiview",
+                    samples_per_batch=40,
+                    root=_EGO_1090_ROOT,
+                    # No ego holdout: headline metrics are teleop-only by design.
+                ),
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=32_000,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=700, peak_lr=3.5e-5, decay_steps=32_000, decay_lr=3.5e-6
+        ),
+        batch_size=64,
+        num_workers=16,
+        save_interval=1_000,
+        max_to_keep=4,
+        keep_period=5_000,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=50,
+            max_token_len=200,
+            paligemma_variant="gemma_2b_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+    ),
     #
     # ---- pi05_abcego_sd: 100% teleop, single source, exactly one epoch ----
     #
