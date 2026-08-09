@@ -615,6 +615,24 @@ _PIPER1H_EGO_ROOT = os.environ.get("PIPER1H_EGO_ROOT", "/workspace/ego_v21")
 # once that per-episode statistic is exported.
 _PIPER1H_EGO_EXCLUDE: tuple[int, ...] = ()
 
+# The 20-minute cut: 10 min teleop + 10 min ego, built on the vast box at
+# /workspace/10t_10e/{teleop_v21,ego_v21}. Same schema, same 20 Hz, same three stored
+# camera keys, same 14-dim state/action as the 1-hour pair -- so it reuses
+# LeRobotPiperMixtureDataConfig and piper_policy unchanged.
+#
+# It is NOT a proportional scale-down of the 1-hour mixture. That one is 1:2 teleop:ego
+# by frames; this one is 1:1 (12,048 vs 12,049 frames). Anything read off this run about
+# mixture RATIO does not transfer to the 1-hour run, and vice versa.
+#
+# Verified on the box before first use, because both defects that broke the 1-hour run
+# are properties of the export pipeline, not of the data:
+#   * parquet HF metadata: 75/75 teleop files carry it, 0 contain "_type": "List"
+#     (the datasets-4.x break). Ego carries no huggingface metadata at all, as before.
+#   * video PTS: all 684 videos (225 teleop + 459 ego) start at pts 0.000000, so no
+#     setts=PTS-STARTPTS rebase is needed. The 1-hour teleop videos all started at 0.05.
+_PIPER20M_TELEOP_ROOT = os.environ.get("PIPER20M_TELEOP_ROOT", "/workspace/10t_10e/teleop_v21")
+_PIPER20M_EGO_ROOT = os.environ.get("PIPER20M_EGO_ROOT", "/workspace/10t_10e/ego_v21")
+
 
 @dataclasses.dataclass(frozen=True)
 class LeRobotYamMixtureDataConfig(LeRobotYamDataConfig):
@@ -1685,6 +1703,126 @@ _CONFIGS = [
         batch_size=64,
         num_workers=16,
         save_interval=600,
+        max_to_keep=1,
+        keep_period=None,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=30,
+            max_token_len=200,
+            paligemma_variant="gemma_2b_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+    ),
+    #
+    # ---- pi05_piper20m_ea: the 20-minute cut, 10 min teleop + 10 min ego, 800 steps ----
+    #
+    # A small, cheap mixture on the same embodiment and the same recipe as
+    # pi05_piper1h_ea. Roughly 1/6 the data and 1/3 the steps, so ~40 min instead of
+    # ~2 h. Useful as a fast turn of the crank; see the WHAT THIS CANNOT TELL YOU note
+    # at the bottom before comparing it to anything.
+    #
+    #   teleop   75 eps / 12,048 frames / 10.04 min / 20 Hz / mean ep 164.7 frames
+    #     minus an 8-episode holdout (fraction 0.1, seed 0)  ->  11,035 train frames
+    #     held out: [1, 2, 5, 19, 22, 35, 43, 57]
+    #   ego     153 eps / 12,049 frames / 10.04 min / 20 Hz / mean ep  78.8 frames
+    #     no holdout, matching pi05_piper1h_ea
+    #
+    # THE DRAW IS 32/32, NOT THE 1-HOUR RUN'S 24/40. The 24/40 split was not a preference
+    # for ego, it was derived: the pools there are 1:2, so an even gradient share would
+    # have given the halves different revisit rates, and 24/40 was what put both at ~2
+    # epochs. Here the pools are already 1:1, so the same rule gives 32/32:
+    #
+    #   teleop  32 x 800 = 25,600 presentations / 11,035 =  2.32 epochs
+    #   ego     32 x 800 = 25,600 presentations / 12,049 =  2.12 epochs
+    #
+    # against the 1-hour run's 2.47 / 2.00. So the design principle carries over even
+    # though the numbers do not. Note the two knobs move together and only their product
+    # matters for exposure -- 32/32 at 800 and 16/16 at 1,600 present identical frame
+    # counts, and differ only in optimiser steps and batch composition.
+    #
+    # Deltas from pi05_piper1h_ea, and the reason for each:
+    #
+    #   asset_id piper20m_p50 -- FRESH NORM STATS, not optional. Same argument as
+    #     pi05_piper1h_teleop: piper1h_p50's quantiles were computed over a 1:2 mixture
+    #     of different episodes. Different pool, different q01/q99, and reusing them
+    #     silently mis-scales the inputs. Recompute BEFORE training:
+    #       uv run scripts/compute_norm_stats.py --config-name pi05_piper20m_ea \
+    #           --max-frames 200000 --skip-videos
+    #
+    #   num_train_steps 2,400 -> 800, decay_steps tracks it so the cosine still lands on
+    #     3.5e-6 at the end rather than being truncated mid-decay.
+    #
+    #   warmup 60 -> 40 (5% of 800, the same fraction pi05_piper1h_teleop used at 600).
+    #     2.5% of 800 is 20 steps, a sharp ramp to a 3.5e-5 peak, and the opening is where
+    #     this recipe is closest to its limit -- pi05_piper1h_ea still hit the gradient
+    #     clip on steps 0-2 with a 60-step warmup.
+    #
+    #   save_interval 250 -> 800, max_to_keep 2 -> 1, keep_period 1_000 -> None.
+    #     Last checkpoint only, by request. 800 steps runs indices 0..799, so an interval
+    #     of 800 never fires mid-run and the only write is the final one at 799. ~13 GB.
+    #
+    # Held identical to pi05_piper1h_ea so the recipe is the constant: batch 64,
+    # action_horizon 30, action_dim 32, max_token_len 200, gemma_2b_lora, peak LR
+    # 3.5e-5 -> 3.5e-6 cosine, EMA off, augmentation on, num_workers 16, and the same
+    # two-camera repack that drops `top`.
+    #
+    # H=30 is still the right horizon here, and by a wider margin on teleop: the clamped
+    # share -- the fraction of training targets that are the episode's final action
+    # repeated, which openpi feeds to the flow loss as a real regression target because
+    # nothing consumes is_pad -- is (H-1)/2L, i.e. 8.8% on teleop (mean ep 164.7) and
+    # 18.4% on ego (mean ep 78.8). At H=50 those become 14.9% and 31.1%.
+    #
+    # WHAT THIS CANNOT TELL YOU. Three things break a head-to-head with pi05_piper1h_ea:
+    # the mixture ratio differs (1:1 vs 1:2 on disk, 32/32 vs 24/40 drawn), the episodes
+    # are a different and possibly overlapping subset, and the holdout is a DIFFERENT
+    # 8 episodes than the 1-hour run's 15 -- selection is deterministic in
+    # (total_episodes, fraction, seed) and total_episodes is 75 here versus 154 there.
+    # So a checkpoint from this config must not be scored against the 1-hour holdout, and
+    # a checkpoint from that one must not be scored against this holdout: in both
+    # directions some of the "held out" episodes are very likely in the other's training
+    # set. Whether these 75 teleop episodes are a subset of the 1-hour 154 has not been
+    # checked; until it is, treat any cross-run eval number as contaminated.
+    #
+    # Cost: ~41 min on 2x A100-SXM4-80GB at the 3.07 s/step measured on pi05_piper1h_ea.
+    TrainConfig(
+        name="pi05_piper20m_ea",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=30,
+            max_token_len=200,
+            paligemma_variant="gemma_2b_lora",
+        ),
+        data=LeRobotPiperMixtureDataConfig(
+            repo_id="angkul07/piper-h-teleop-v21",
+            assets=AssetsConfig(asset_id="piper20m_p50"),
+            base_config=DataConfig(prompt_from_task=True),
+            sources=(
+                MixtureSource(
+                    repo_id="angkul07/piper-h-teleop-v21",
+                    samples_per_batch=32,
+                    root=_PIPER20M_TELEOP_ROOT,
+                    # 8 of 75 episodes; NOT the 1-hour run's 15. See the note above.
+                    holdout_fraction=0.1,
+                    holdout_seed=0,
+                ),
+                MixtureSource(
+                    repo_id="angkul07/piper-h-ego-v21",
+                    samples_per_batch=32,
+                    root=_PIPER20M_EGO_ROOT,
+                    # No ego holdout: headline metrics are teleop-only by design.
+                ),
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=800,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=40, peak_lr=3.5e-5, decay_steps=800, decay_lr=3.5e-6
+        ),
+        batch_size=64,
+        num_workers=16,
+        save_interval=800,
         max_to_keep=1,
         keep_period=None,
         freeze_filter=pi0_config.Pi0Config(
