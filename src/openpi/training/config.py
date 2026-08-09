@@ -19,6 +19,7 @@ import openpi.models.model as _model
 import openpi.models.pi0_config as pi0_config
 import openpi.models.pi0_fast as pi0_fast
 import openpi.models.tokenizer as _tokenizer
+from openpi.policies import piper_policy
 from openpi.policies import yam_policy
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
@@ -585,6 +586,35 @@ _ABCEGO_SD_ROOT = os.environ.get("ABCEGO_SD_ROOT", "/workspace/abc-ego-lerobot")
 # YAM50RUN_ROOT at it, otherwise stage [0] reports the dataset as missing.
 _50RUN_ROOT = os.environ.get("YAM50RUN_ROOT", "/workspace/50_run")
 
+# Roots for the 1-hour Piper H mixture. A DIFFERENT EMBODIMENT from every YAM root
+# above -- Piper H, not YAM -- and a different frame rate: 20 Hz on both halves,
+# against 30 Hz everywhere else in this file. Both halves are LeRobot v2.1, 14-D
+# state/action, and carry the same three camera keys (front/right/top).
+#   ego     613 eps /  47,953 frames / 39.96 min  -- retargeted EgoDex, 100 tasks
+#   teleop  154 eps /  25,075 frames / 20.90 min  -- real Piper H, 1 task
+#   total   767 eps /  73,028 frames / 60.86 min  -- ego 65.7% / teleop 34.3% by frames
+# Published as angkul07/piper-h-ego-teleop-v21 (private); the README there carries the
+# full stats table. Built on the vast box at /workspace/{ego_v21,teleop_v21}, which is
+# what these defaults point at.
+#
+# NOTE both halves are standalone datasets numbered 0..N-1, so `exclude_episodes`
+# indices refer to THESE datasets, not to any upstream numbering.
+_PIPER1H_TELEOP_ROOT = os.environ.get("PIPER1H_TELEOP_ROOT", "/workspace/teleop_v21")
+_PIPER1H_EGO_ROOT = os.environ.get("PIPER1H_EGO_ROOT", "/workspace/ego_v21")
+
+# Ego episodes to withhold for bad retargeting. EMPTY BY DEFAULT -- populating it is a
+# decision that has not been made yet, and it changes the step count (see the epoch
+# table on pi05_piper1h_ea).
+#
+# The retarget error is BIMODAL, not uniform: 4.770 cm mean over all 613 clips, but
+# 0.701 cm on clips where the wrist orientation constraint is never pinned versus
+# 6.944 cm on clips where it is pinned in >50% of frames. The cause is Piper's joint5
+# range (+-1.22 rad) against the +-1.571 the source retarget assumed. So the useful
+# filter is the WRIST-PINNING FRACTION, not the PASS/WARN/FAIL bucket from QA -- the
+# 105/328/180 split cuts across both modes. Fill this with the pinned->50% clip indices
+# once that per-episode statistic is exported.
+_PIPER1H_EGO_EXCLUDE: tuple[int, ...] = ()
+
 
 @dataclasses.dataclass(frozen=True)
 class LeRobotYamMixtureDataConfig(LeRobotYamDataConfig):
@@ -601,6 +631,104 @@ class LeRobotYamMixtureDataConfig(LeRobotYamDataConfig):
     """
 
     # The mixture. `samples_per_batch` across all sources must equal TrainConfig.batch_size.
+    sources: tyro.conf.Suppress[Sequence[MixtureSource]] = ()
+    # Training-time image augmentation. Set to None to disable.
+    augment_config: tyro.conf.Suppress[_augment.ImageAugmentConfig | None] = dataclasses.field(
+        default_factory=_augment.ImageAugmentConfig
+    )
+
+    @override
+    def create(self, assets_dirs, model_config):
+        config = super().create(assets_dirs, model_config)
+        train_only = _transforms.Group()
+        if self.augment_config is not None:
+            train_only = _transforms.Group(inputs=[_augment.ImageAugment(self.augment_config)])
+        return dataclasses.replace(config, mixture=tuple(self.sources), train_only_transforms=train_only)
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotPiperDataConfig(DataConfigFactory):
+    """Piper H data config. Mirrors LeRobotYamDataConfig; the deltas are the cameras.
+
+    TWO of the three stored camera keys are used. `observation.images.top` is
+    deliberately absent from the repack below, which is the whole mechanism for
+    dropping it -- RepackTransform discards any key it does not list. See
+    `piper_policy` for why: the key names do not describe the content, and `top` is
+    the one slot whose content does NOT correspond across the two halves of the
+    mixture (teleop `top` is a sideways view of the robot; ego `top` is a wide crop
+    on the grasp point).
+
+    DROPPING IT HERE DOES NOT SKIP ITS VIDEO DECODE. LeRobotDataset decodes every
+    video feature before the repack runs, so the `top` stream is still paid for on
+    the dataloader. Removing that cost means not writing the key during conversion
+    (or subsetting the features at the dataset level) -- worth doing, since decode
+    already saturates the cgroup CPU quota on the vast boxes.
+    """
+
+    # Piper stores ABSOLUTE actions on both halves, so convert the arm-joint dims to
+    # deltas relative to current state; grippers stay absolute. Same as YAM/ALOHA.
+    use_delta_joint_actions: bool = True
+
+    @override
+    def create(self, assets_dirs, model_config):
+        # LEFT = target key (what PiperInputs reads), RIGHT = dataset feature name.
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/front_image": "observation.images.front",
+                        "observation/right_image": "observation.images.right",
+                        # "observation.images.top" intentionally omitted -- see docstring.
+                        "observation/state": "observation.state",
+                        "actions": "action",
+                        # prompt_from_task adds "prompt" BEFORE this repack; it must be
+                        # listed or RepackTransform drops it -> "Prompt is required".
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+
+        data_transforms = _transforms.Group(
+            inputs=[piper_policy.PiperInputs(model_type=model_config.model_type)],
+            outputs=[piper_policy.PiperOutputs()],
+        )
+
+        # ABSOLUTE -> DELTA. make_bool_mask(6, -1, 6, -1) = [6 joints -> delta,
+        # 1 gripper -> absolute] per arm. Piper H is 6-DOF + gripper per arm, so the
+        # 14-D layout matches YAM's:
+        #   [arm0: 6 joints, arm0 gripper, arm1: 6 joints, arm1 gripper]
+        if self.use_delta_joint_actions:
+            delta_action_mask = _transforms.make_bool_mask(6, -1, 6, -1)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+
+        model_transforms = ModelTransformFactory()(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            # Action column is "action" (singular), like ALOHA and the YAM datasets.
+            action_sequence_keys=("action",),
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotPiperMixtureDataConfig(LeRobotPiperDataConfig):
+    """Piper H config that samples from several LeRobot datasets at a fixed ratio.
+
+    Identical machinery to LeRobotYamMixtureDataConfig -- fixed samples-per-source
+    per batch, so a source's gradient share is set explicitly and independently of
+    how much of it is on disk. All sources share this config's repack/data
+    transforms, so they must share a feature schema (same camera keys, same
+    state/action layout, same fps).
+    """
+
+    # `samples_per_batch` across all sources must equal TrainConfig.batch_size.
     sources: tyro.conf.Suppress[Sequence[MixtureSource]] = ()
     # Training-time image augmentation. Set to None to disable.
     augment_config: tyro.conf.Suppress[_augment.ImageAugmentConfig | None] = dataclasses.field(
@@ -1245,6 +1373,163 @@ _CONFIGS = [
             pi05=True,
             action_dim=32,
             action_horizon=50,
+            max_token_len=200,
+            paligemma_variant="gemma_2b_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+    ),
+    #
+    # ---- pi05_piper1h_ea: the 1-hour Piper H mixture, 50/50 draw ----
+    #
+    # FIRST NON-YAM ARM IN THIS FILE. Different embodiment (Piper H), different rate
+    # (20 Hz, not 30), and 10x less data than any yam7h arm. None of the step counts
+    # above transfer -- the "1-2 epochs" logic of the 7 h mixtures is a large-dataset
+    # rule, and applying it here would give ~1,500 steps of training.
+    #
+    #   ego     613 eps /  47,953 frames / 39.96 min   65.7% of stored frames, 100 tasks
+    #   teleop  154 eps /  25,075 frames / 20.90 min   34.3% of stored frames, 1 task
+    #   total   767 eps /  73,028 frames / 60.86 min
+    #
+    # DRAW 32/32 at batch 64, 8,000 steps:
+    #
+    #                              teleop        ego
+    #   samples per batch              32         32
+    #   gradient share             50.0 %     50.0 %
+    #   frames seen over run      256,000    256,000
+    #   effective epochs            11.3        5.34
+    #   oversample vs storage       1.46x      0.76x
+    #   per-frame exposure ratio: each teleop frame is drawn 2.12x as often as each ego frame
+    #
+    # Teleop's epoch count is against the POST-HOLDOUT pool (~22,600 frames, see
+    # holdout_fraction below), not the 25,075 stored. Combined that is 512,000
+    # presentations over ~70,500 trained frames = 7.26 epochs.
+    #
+    # WHY 32/32 AND NOT THE 24/40 OF pi05_yam1090_ea. The three quantities that all get
+    # called "oversampling" only diverge when the pools are far apart. Here they are
+    # 1.91x apart -- close to the yam7h arms' 2.0x, nothing like yam1090's 9.0x -- so the
+    # even draw is the sane default: teleop gets a 1.46x oversample on storage share, a
+    # 2.12x per-frame revisit rate, and 1:1 parity on TOTAL presentations, which is the
+    # measure yam1090 could not reach at any step count.
+    #
+    # Deltas from pi05_yam1090_ea, and the reason for each:
+    #
+    #   action_horizon 50 -> 30. TWO independent reasons, either sufficient.
+    #     (a) openpi's LeRobot path CLAMPS delta_timestamps at episode ends (it repeats
+    #         the final action) rather than dropping the sample, and NOTHING in openpi
+    #         consumes `is_pad` -- grep it. So clamped steps enter the flow-matching loss
+    #         as genuine regression targets. An 11-frame ego episode at H=50 teaches
+    #         "emit this pose 39 more times". The clamped share of supervised action
+    #         steps is (H-1)/2L; at ego's mean length of 78 frames that is 31.3% at H=50
+    #         against 18.5% at H=30, and at ego's MEDIAN length of 60 it is 40.8% against
+    #         24.2%. This is signal corruption, not merely reweighting.
+    #     (b) 20 Hz. H=30 at 20 Hz is 1.5 s, which is the same physical horizon that H=50
+    #         gave the 30 Hz YAM arms (1.67 s). Inheriting 50 here would silently ask for
+    #         a 2.5 s chunk.
+    #     Must match in `freeze_filter` too, or the LoRA filter is built for a different
+    #     model shape than the one being trained.
+    #
+    #   batch 64 held, steps 32,000 -> 8,000. At 1/10th the data, holding steps would be
+    #     ~51 teleop epochs. 8,000 puts teleop at 11.3 and ego at 5.34, which is the
+    #     normal range for a small-dataset finetune and already the overfit-risk side of
+    #     it -- hence the checkpoint pinning below.
+    #
+    #   warmup 700 -> 200 (2.5% of 8,000, matching the ~2.1-2.5% used throughout).
+    #
+    #   keep_period 5_000 -> 1_000, save_interval 1_000 -> 500.
+    #     At 11.3 teleop epochs on a SINGLE task, the overfit knee is the thing this run
+    #     has to locate, and it is expected early (~3-5k). keep_period=5_000 would pin
+    #     only 5k, which is likely already past it. 1_000 pins 1k..8k = 8 checkpoints at
+    #     ~13 GB each, ~104 GB. Raise to 2_000 if disk is tight.
+    #
+    #   holdout_fraction=0.1 on teleop instead of an explicit index manifest.
+    #     There is no vast_run/make_holdout.py run for this dataset yet, and
+    #     _TELEOP_HOLDOUT_EPISODES holds abc-teleop indices that mean nothing here.
+    #     select_holdout_episodes is deterministic given (total_episodes, fraction,
+    #     seed), so the split is reproducible and travels with the config -- but it is
+    #     chosen at RANDOM, not inspected. Replace with an explicit list once someone has
+    #     looked at the episodes. ~15 of 154 episodes withheld.
+    #     Without this there is no honest offline eval at all.
+    #
+    #   asset_id piper1h_p50 -- FRESH NORM STATS. Nothing above can be copied: different
+    #     embodiment, different joint ranges, different camera set, different fps. Stats
+    #     are computed through the SAME sampler, so the 32/32 draw is baked into them:
+    #       uv run scripts/compute_norm_stats.py --config-name pi05_piper1h_ea \
+    #           --max-frames 200000 --skip-videos
+    #     run_yam.sh stage [1/3] skips computation whenever the file already exists, so a
+    #     stray copied assets directory would silently normalize the wrong distribution.
+    #
+    # CAMERAS: 2 real + 1 masked padding slot, against 3 real on every YAM arm. The
+    # `top` key is dropped in LeRobotPiperDataConfig's repack because its content does
+    # not correspond across the two halves -- see piper_policy's module docstring for
+    # the mapping table and for why the wrist view goes in slot 1 rather than slot 2.
+    #
+    # KNOWN GAPS, deliberately not addressed here:
+    #   * Ego gripper scale is NOT rescaled onto the teleop range. The measured problem
+    #     from the 7h mixture (ego "open" normalizing closer to teleop's CLOSED, which
+    #     pi0.5's few-step flow matching then mode-averages into a half-open hand) has
+    #     not been re-measured on Piper. vast_run/pi05/rescale_ego_gripper.py is the
+    #     tool; run it against this mixture before trusting grasp behaviour.
+    #   * No rotation matching between halves: teleop is 480x640 portrait and stored
+    #     rotated, ego is 224x224 square, so the resize to 224 squashes teleop ~1.33x
+    #     vertically. Squash-vs-crop is an open preprocessing choice (ROT90_K = 0).
+    #   * _PIPER1H_EGO_EXCLUDE is empty. Filling it shrinks the ego pool by ~29% and
+    #     pushes ego to ~7.6 epochs at 8,000 steps (pool ~33,900 frames); hold ego at
+    #     5.34 by dropping to ~5,700 steps, which also takes teleop to ~8.1.
+    #   * Ego has 100 task strings and teleop has 1, so `prompt_from_task` conditions
+    #     the ego half and does nothing for the half the eval scores.
+    #
+    # Held fixed on purpose: peak LR 3.5e-5 -> 3.5e-6 cosine, EMA off, gemma_2b_lora,
+    # action_dim 32, max_token_len 200. Fresh finetune from pi05_base.
+    #
+    # Cost: ~2.9 h on 2x H100 SXM at ~1.3 s/step, extrapolated from the 1.388 s/step
+    # measured on pi05_50run_ea at the same batch size and architecture (slightly less
+    # here from the shorter action horizon; the masked camera saves NOTHING, since
+    # Pi0.embed_prefix runs SigLIP on the zeros image regardless).
+    TrainConfig(
+        name="pi05_piper1h_ea",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=30,
+            max_token_len=200,
+            paligemma_variant="gemma_2b_lora",
+        ),
+        data=LeRobotPiperMixtureDataConfig(
+            repo_id="angkul07/piper-h-teleop-v21",
+            assets=AssetsConfig(asset_id="piper1h_p50"),
+            base_config=DataConfig(prompt_from_task=True),
+            sources=(
+                MixtureSource(
+                    repo_id="angkul07/piper-h-teleop-v21",
+                    samples_per_batch=32,
+                    root=_PIPER1H_TELEOP_ROOT,
+                    # Deterministic random split; see the holdout note above.
+                    holdout_fraction=0.1,
+                    holdout_seed=0,
+                ),
+                MixtureSource(
+                    repo_id="angkul07/piper-h-ego-v21",
+                    samples_per_batch=32,
+                    root=_PIPER1H_EGO_ROOT,
+                    # No ego holdout: headline metrics are teleop-only by design.
+                    exclude_episodes=_PIPER1H_EGO_EXCLUDE,
+                ),
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=8_000,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=200, peak_lr=3.5e-5, decay_steps=8_000, decay_lr=3.5e-6
+        ),
+        batch_size=64,
+        num_workers=16,
+        save_interval=500,
+        max_to_keep=4,
+        keep_period=1_000,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=30,
             max_token_len=200,
             paligemma_variant="gemma_2b_lora",
         ).get_freeze_filter(),
