@@ -1501,10 +1501,30 @@ _CONFIGS = [
     # Held fixed on purpose: peak LR 3.5e-5 -> 3.5e-6 cosine, EMA off, gemma_2b_lora,
     # action_dim 32, max_token_len 200. Fresh finetune from pi05_base.
     #
-    # Cost: ~52 min on 2x H100 SXM at ~1.3 s/step, extrapolated from the 1.388 s/step
-    # measured on pi05_50run_ea at the same batch size and architecture (slightly less
-    # here from the shorter action horizon; the masked camera saves NOTHING, since
-    # Pi0.embed_prefix runs SigLIP on the zeros image regardless).
+    # TARGET BOX: 2x A100-SXM4-80GB (NVLink), data parallel, 32 samples/GPU.
+    #
+    # Cost: ~2.4 h. That is 2,400 steps at the 3.528 s/step MEASURED on exactly this
+    # hardware at batch 64 -- see the benchmark table in vast_run/README.md. It is not
+    # extrapolated across GPU types: the A100-SXM row matches this config's batch size,
+    # architecture and camera count directly. H=30 trims the suffix by 20 tokens out of
+    # ~1,000, so ~3.4-3.5 s/step if anything; the masked camera saves NOTHING, since
+    # Pi0.embed_prefix runs SigLIP on the zeros image regardless.
+    #
+    # DO NOT re-derive this from the 1.388 s/step quoted on pi05_yam1090_ea. That is an
+    # H100 SXM number and is ~2.5x optimistic for an A100. Measured reference points at
+    # batch 64: A100 SXM 3.528 | H100 PCIe 2.178 (H100 PCIe is only 1.62x the A100, not
+    # the 2.65x the FP32 TFLOPS ratio suggests -- no NVLink on that PCIe box).
+    #
+    # Memory: fits, with the same headroom as the measured run. pi0.5 trains the action
+    # expert FULL-RANK, so the trainable set is 872.8M (expert 427.9M + SigLIP 414.8M +
+    # LoRA 27.9M + projections 2.2M) against the 2508.5M frozen Gemma trunk, and AdamW
+    # moments and grads come to ~10.5 GB/GPU under --fsdp-devices 1. Checkpoints are
+    # ~25-30% larger than a pure-LoRA arm for the same reason.
+    #
+    # num_workers stays 16: measured non-lever on this exact box (3.528 s/step at 16 vs
+    # 3.545 at 32, below the noise floor). The loader uses ~3 cores; it is compute-bound.
+    # Worth one preflight though -- check per-GPU clocks and temps before committing the
+    # run; the benchmarked A100 pair was power-capped at 275 of 400 W.
     TrainConfig(
         name="pi05_piper1h_ea",
         model=pi0_config.Pi0Config(
