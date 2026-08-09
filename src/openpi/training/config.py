@@ -1593,6 +1593,110 @@ _CONFIGS = [
         ema_decay=None,
     ),
     #
+    # ---- pi05_piper1h_teleop: the teleop half alone, 600 steps ----
+    #
+    # The single-source control for pi05_piper1h_ea. Same embodiment, same cameras, same
+    # horizon, same LR -- the ONLY variable removed is the ego half. Without this arm
+    # there is nothing to attribute the mixture's behaviour to: pi05_piper1h_ea cannot
+    # tell you whether the 613 retargeted ego clips helped, hurt, or did nothing.
+    #
+    #   teleop  154 eps / 25,075 frames / 20.90 min / 1 task / 20 Hz
+    #   minus the same 15-episode holdout      ->  23,347 train frames
+    #
+    # 600 steps at batch 64 = 38,400 frames seen = 1.64 epochs.
+    #
+    # NOTE THIS IS LESS TELEOP EXPOSURE THAN THE MIXTURE ARM GOT. pi05_piper1h_ea drew 24
+    # teleop samples for 2,400 steps = 57,600 teleop frames = 2.47 teleop epochs. At 600
+    # steps this arm sees 38,400, i.e. 0.67x as much teleop. So a head-to-head is NOT a
+    # clean ablation of "ego added or not" -- it also halves teleop exposure and cuts
+    # total optimiser steps 4x. To isolate the ego contribution properly the teleop-only
+    # arm needs 973 steps (57,600 / 64) to match teleop frames seen, or 2,400 steps to
+    # match optimiser steps. 600 was chosen for cost; read the comparison accordingly.
+    #
+    # Deltas from pi05_piper1h_ea, and the reason for each:
+    #
+    #   A MIXTURE OF ONE, deliberately -- not a plain single-source data config.
+    #     Same two reasons as pi05_abcego_sd below: create_torch_dataset() hardcodes
+    #     root=None on the non-mixture path (so the dataset would have to sit at
+    #     $HF_LEROBOT_HOME/<repo_id> rather than /workspace/teleop_v21), and run_yam.sh
+    #     stage [0] asserts data.mixture is non-empty. StratifiedBatchSampler with one
+    #     source just draws all 64 indices from a reshuffled permutation of it, i.e.
+    #     ordinary shuffled training.
+    #
+    #   asset_id piper1h_teleop_only -- FRESH NORM STATS, and this one is not optional.
+    #     Reusing piper1h_p50 would be a silent, material bug: those quantiles were
+    #     computed over the 24/40 mixture, whose distribution is dominated by ego's much
+    #     wider joint ranges (ego action dim0 spans [0.24, 2.56] against teleop's
+    #     [0.15, 0.91]) and whose gripper duty cycle is different (teleop p50 = 1.0, ego
+    #     p50 = 0.0). Normalizing teleop against that mixture compresses teleop into a
+    #     fraction of the [-1, 1] axis and shifts the gripper midpoint. Recompute:
+    #       uv run scripts/compute_norm_stats.py --config-name pi05_piper1h_teleop \
+    #           --max-frames 200000 --skip-videos
+    #
+    #   save_interval 250 -> 600, max_to_keep 2 -> 1, keep_period 1_000 -> None.
+    #     Last checkpoint only, by request. num_train_steps=600 runs steps 0..599, so an
+    #     interval of 600 never fires mid-run and the only write is the final one at 599.
+    #     ~13 GB total instead of the mixture arm's ~52 GB.
+    #
+    #   warmup 60 -> 30 (5% of 600, not the 2.5% used elsewhere).
+    #     2.5% of 600 is 15 steps, which is a very fast ramp to a 3.5e-5 peak.
+    #     pi05_piper1h_ea's gradient clipping bound on steps 0-2 even with a 60-step
+    #     warmup, so the opening is the one place this recipe is near its limit. 30 keeps
+    #     the ramp gentle without materially changing the schedule.
+    #
+    # Held identical to pi05_piper1h_ea on purpose, so the ego half is the only variable:
+    # batch 64, action_horizon 30, action_dim 32, max_token_len 200, gemma_2b_lora, peak
+    # LR 3.5e-5 -> 3.5e-6 cosine, EMA off, augmentation on, the same 15-episode holdout
+    # (holdout_fraction=0.1, seed 0 -> the SAME episodes, since selection is deterministic
+    # in total_episodes/fraction/seed and the source dataset is unchanged), and the same
+    # two-camera repack that drops `top`.
+    #
+    # Cost: ~31 min on 2x A100-SXM4-80GB at the 3.07 s/step measured on pi05_piper1h_ea.
+    TrainConfig(
+        name="pi05_piper1h_teleop",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=30,
+            max_token_len=200,
+            paligemma_variant="gemma_2b_lora",
+        ),
+        data=LeRobotPiperMixtureDataConfig(
+            repo_id="angkul07/piper-h-teleop-v21",
+            assets=AssetsConfig(asset_id="piper1h_teleop_only"),
+            base_config=DataConfig(prompt_from_task=True),
+            sources=(
+                MixtureSource(
+                    repo_id="angkul07/piper-h-teleop-v21",
+                    samples_per_batch=64,
+                    root=_PIPER1H_TELEOP_ROOT,
+                    # Same split as the mixture arm -- deterministic in (total_episodes,
+                    # fraction, seed), so these are the same 15 episodes.
+                    holdout_fraction=0.1,
+                    holdout_seed=0,
+                ),
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=600,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=30, peak_lr=3.5e-5, decay_steps=600, decay_lr=3.5e-6
+        ),
+        batch_size=64,
+        num_workers=16,
+        save_interval=600,
+        max_to_keep=1,
+        keep_period=None,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=30,
+            max_token_len=200,
+            paligemma_variant="gemma_2b_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+    ),
+    #
     # ---- pi05_abcego_sd: 100% teleop, single source, exactly one epoch ----
     #
     # Source: angkul07/abc-ego `put_the_screwdriver_in_the_bin`, converted from MCAP by
