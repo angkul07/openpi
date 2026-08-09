@@ -1379,37 +1379,52 @@ _CONFIGS = [
         ema_decay=None,
     ),
     #
-    # ---- pi05_piper1h_ea: the 1-hour Piper H mixture, 50/50 draw ----
+    # ---- pi05_piper1h_ea: the 1-hour Piper H mixture, ~2 epochs per source ----
     #
     # FIRST NON-YAM ARM IN THIS FILE. Different embodiment (Piper H), different rate
-    # (20 Hz, not 30), and 10x less data than any yam7h arm. None of the step counts
-    # above transfer -- the "1-2 epochs" logic of the 7 h mixtures is a large-dataset
-    # rule, and applying it here would give ~1,500 steps of training.
+    # (20 Hz, not 30), and 10x less data than any yam7h arm.
     #
     #   ego     613 eps /  47,953 frames / 39.96 min   65.7% of stored frames, 100 tasks
     #   teleop  154 eps /  25,075 frames / 20.90 min   34.3% of stored frames, 1 task
     #   total   767 eps /  73,028 frames / 60.86 min
     #
-    # DRAW 32/32 at batch 64, 8,000 steps:
+    # DRAW 24/40 at batch 64, 2,400 steps:
     #
     #                              teleop        ego
-    #   samples per batch              32         32
-    #   gradient share             50.0 %     50.0 %
-    #   frames seen over run      256,000    256,000
-    #   effective epochs            11.3        5.34
-    #   oversample vs storage       1.46x      0.76x
-    #   per-frame exposure ratio: each teleop frame is drawn 2.12x as often as each ego frame
+    #   samples per batch              24         40
+    #   gradient share             37.5 %     62.5 %
+    #   frames seen over run       57,600     96,000
+    #   effective epochs             2.55       2.00
+    #   oversample vs storage       1.17x      0.92x
+    #   per-frame exposure ratio: each teleop frame is drawn 1.27x as often as each ego frame
     #
     # Teleop's epoch count is against the POST-HOLDOUT pool (~22,600 frames, see
-    # holdout_fraction below), not the 25,075 stored. Combined that is 512,000
-    # presentations over ~70,500 trained frames = 7.26 epochs.
+    # holdout_fraction below), not the 25,075 stored -- so teleop is 32.1% of the pool
+    # actually trained on, not 34.3%. Combined that is 153,600 presentations over
+    # ~70,600 trained frames = 2.18 epochs.
     #
-    # WHY 32/32 AND NOT THE 24/40 OF pi05_yam1090_ea. The three quantities that all get
-    # called "oversampling" only diverge when the pools are far apart. Here they are
-    # 1.91x apart -- close to the yam7h arms' 2.0x, nothing like yam1090's 9.0x -- so the
-    # even draw is the sane default: teleop gets a 1.46x oversample on storage share, a
-    # 2.12x per-frame revisit rate, and 1:1 parity on TOTAL presentations, which is the
-    # measure yam1090 could not reach at any step count.
+    # THE POST-HOLDOUT FIGURE IS AN ESTIMATE. It assumes the 10% holdout removes an
+    # average slice, but teleop episode lengths run 4..352 frames, so the real number
+    # will differ. create_torch_dataset logs it at startup ("mixture source ...: N train
+    # frames"); read it off the first run and re-derive the epochs if it is far off.
+    #
+    # WHY ~2 EPOCHS PER SOURCE, AND WHY THAT FORCES 24/40 RATHER THAN AN EVEN DRAW.
+    # A fixed-count sampler gives every source the SAME number of frames per step, so
+    # epoch counts land in inverse proportion to pool size and one draw fixes one ratio.
+    # The pools are 2.12x apart post-holdout, so 32/32 cannot put both sources near 2:
+    # it reaches ego 2.0 only at 3,000 steps, by which point teleop is at 4.24. Matching
+    # epochs across sources means matching the draw to storage share.
+    #
+    # The proportional (zero-oversample) draw is 20.5/43.5, i.e. 32.1% of 64. Exactly
+    # 2.0/2.0 would be 21/43 at 2,200 steps -- but that is proportional sampling, and it
+    # gives up teleop oversampling altogether even though teleop is the real embodiment
+    # and the only half the eval scores. 24/40 is the deliberate middle: ego at exactly
+    # 2.00, teleop at 2.55, and a residual 1.17x tilt toward the eval domain. Any draw
+    # above 21 teleop samples oversamples teleop on gradient share and revisit rate.
+    #
+    # Note teleop remains the MINORITY on total presentations (24:40) -- steps cancel out
+    # of that measure, it is fixed by the draw alone. Same three-quantities point as
+    # pi05_yam1090_ea, just at a much smaller pool ratio.
     #
     # Deltas from pi05_yam1090_ea, and the reason for each:
     #
@@ -1428,18 +1443,23 @@ _CONFIGS = [
     #     Must match in `freeze_filter` too, or the LoRA filter is built for a different
     #     model shape than the one being trained.
     #
-    #   batch 64 held, steps 32,000 -> 8,000. At 1/10th the data, holding steps would be
-    #     ~51 teleop epochs. 8,000 puts teleop at 11.3 and ego at 5.34, which is the
-    #     normal range for a small-dataset finetune and already the overfit-risk side of
-    #     it -- hence the checkpoint pinning below.
+    #   batch 64 held, steps 32,000 -> 2,400. Set by the ~2-epochs-per-source target
+    #     above, not by scaling the yam1090 step count: 40 ego samples x 2,400 steps is
+    #     2.00 ego epochs on the nose.
     #
-    #   warmup 700 -> 200 (2.5% of 8,000, matching the ~2.1-2.5% used throughout).
+    #     THIS IS A DELIBERATELY LIGHT TOUCH. At ~2 epochs on one hour, from pi05_base
+    #     with LoRA, the run will largely preserve base behaviour rather than specialise
+    #     to the task -- a conservative first arm, not a converged one. The failure mode
+    #     is UNDER-training, which is the opposite of every arm above; do not read a
+    #     flat-ish loss curve here as the overfit knee.
     #
-    #   keep_period 5_000 -> 1_000, save_interval 1_000 -> 500.
-    #     At 11.3 teleop epochs on a SINGLE task, the overfit knee is the thing this run
-    #     has to locate, and it is expected early (~3-5k). keep_period=5_000 would pin
-    #     only 5k, which is likely already past it. 1_000 pins 1k..8k = 8 checkpoints at
-    #     ~13 GB each, ~104 GB. Raise to 2_000 if disk is tight.
+    #   warmup 700 -> 60 (2.5% of 2,400, matching the ~2.1-2.5% used throughout).
+    #
+    #   keep_period 5_000 -> 500, save_interval 1_000 -> 250.
+    #     Not for overfit-knee hunting -- at 2.55 teleop epochs there is unlikely to be
+    #     one. This is purely resolution: a 2,400-step run needs checkpoints close
+    #     enough together to compare, and save_interval 1_000 would yield two. 250 with
+    #     keep_period 500 pins 500/1000/1500/2000 plus the final, ~5 x 13 GB = ~65 GB.
     #
     #   holdout_fraction=0.1 on teleop instead of an explicit index manifest.
     #     There is no vast_run/make_holdout.py run for this dataset yet, and
@@ -1452,7 +1472,7 @@ _CONFIGS = [
     #
     #   asset_id piper1h_p50 -- FRESH NORM STATS. Nothing above can be copied: different
     #     embodiment, different joint ranges, different camera set, different fps. Stats
-    #     are computed through the SAME sampler, so the 32/32 draw is baked into them:
+    #     are computed through the SAME sampler, so the 24/40 draw is baked into them:
     #       uv run scripts/compute_norm_stats.py --config-name pi05_piper1h_ea \
     #           --max-frames 200000 --skip-videos
     #     run_yam.sh stage [1/3] skips computation whenever the file already exists, so a
@@ -1472,16 +1492,16 @@ _CONFIGS = [
     #   * No rotation matching between halves: teleop is 480x640 portrait and stored
     #     rotated, ego is 224x224 square, so the resize to 224 squashes teleop ~1.33x
     #     vertically. Squash-vs-crop is an open preprocessing choice (ROT90_K = 0).
-    #   * _PIPER1H_EGO_EXCLUDE is empty. Filling it shrinks the ego pool by ~29% and
-    #     pushes ego to ~7.6 epochs at 8,000 steps (pool ~33,900 frames); hold ego at
-    #     5.34 by dropping to ~5,700 steps, which also takes teleop to ~8.1.
+    #   * _PIPER1H_EGO_EXCLUDE is empty. Filling it shrinks the ego pool by ~29% (to
+    #     ~33,900 frames) and pushes ego to 2.83 epochs at 2,400 steps; hold ego at 2.00
+    #     by dropping to ~1,700 steps, which also takes teleop to ~1.80.
     #   * Ego has 100 task strings and teleop has 1, so `prompt_from_task` conditions
     #     the ego half and does nothing for the half the eval scores.
     #
     # Held fixed on purpose: peak LR 3.5e-5 -> 3.5e-6 cosine, EMA off, gemma_2b_lora,
     # action_dim 32, max_token_len 200. Fresh finetune from pi05_base.
     #
-    # Cost: ~2.9 h on 2x H100 SXM at ~1.3 s/step, extrapolated from the 1.388 s/step
+    # Cost: ~52 min on 2x H100 SXM at ~1.3 s/step, extrapolated from the 1.388 s/step
     # measured on pi05_50run_ea at the same batch size and architecture (slightly less
     # here from the shorter action horizon; the masked camera saves NOTHING, since
     # Pi0.embed_prefix runs SigLIP on the zeros image regardless).
@@ -1501,7 +1521,7 @@ _CONFIGS = [
             sources=(
                 MixtureSource(
                     repo_id="angkul07/piper-h-teleop-v21",
-                    samples_per_batch=32,
+                    samples_per_batch=24,
                     root=_PIPER1H_TELEOP_ROOT,
                     # Deterministic random split; see the holdout note above.
                     holdout_fraction=0.1,
@@ -1509,7 +1529,7 @@ _CONFIGS = [
                 ),
                 MixtureSource(
                     repo_id="angkul07/piper-h-ego-v21",
-                    samples_per_batch=32,
+                    samples_per_batch=40,
                     root=_PIPER1H_EGO_ROOT,
                     # No ego holdout: headline metrics are teleop-only by design.
                     exclude_episodes=_PIPER1H_EGO_EXCLUDE,
@@ -1517,15 +1537,15 @@ _CONFIGS = [
             ),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        num_train_steps=8_000,
+        num_train_steps=2_400,
         lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=200, peak_lr=3.5e-5, decay_steps=8_000, decay_lr=3.5e-6
+            warmup_steps=60, peak_lr=3.5e-5, decay_steps=2_400, decay_lr=3.5e-6
         ),
         batch_size=64,
         num_workers=16,
-        save_interval=500,
+        save_interval=250,
         max_to_keep=4,
-        keep_period=1_000,
+        keep_period=500,
         freeze_filter=pi0_config.Pi0Config(
             pi05=True,
             action_dim=32,
