@@ -1455,11 +1455,28 @@ _CONFIGS = [
     #
     #   warmup 700 -> 60 (2.5% of 2,400, matching the ~2.1-2.5% used throughout).
     #
-    #   keep_period 5_000 -> 500, save_interval 1_000 -> 250.
+    #   keep_period 5_000 -> 1_000, save_interval 1_000 -> 250, max_to_keep 4 -> 2.
     #     Not for overfit-knee hunting -- at 2.55 teleop epochs there is unlikely to be
-    #     one. This is purely resolution: a 2,400-step run needs checkpoints close
-    #     enough together to compare, and save_interval 1_000 would yield two. 250 with
-    #     keep_period 500 pins 500/1000/1500/2000 plus the final, ~5 x 13 GB = ~65 GB.
+    #     one. save_interval is about resolution: a 2,400-step run needs checkpoints
+    #     close enough together to compare, and 1_000 would yield two.
+    #
+    #     max_to_keep and keep_period are set by DISK, measured on the target box: the
+    #     A100 container has a 150 GB overlay and nothing else usable (the 16 T
+    #     vg0-lv_storage is a host bind-mount on /etc/hosts, not writable space).
+    #     pi0.5 checkpoints run ~16-17 GB -- the ~13 GB of the pi0-FAST yam arms plus
+    #     the 25-30% from training the action expert full-rank. Budget:
+    #       uv env 11 GB (MEASURED after uv sync) + pi05_base ~14 GB + datasets ~5 GB
+    #       = ~30 GB before training, leaving ~120 GB.
+    #     At max_to_keep=4 / keep_period=500 the retained set is pins {500,1000,1500,
+    #     2000} union the rolling last four {1750,2250,2400} = 7 checkpoints ~115 GB.
+    #     That fits only if every checkpoint lands at the bottom of the 16-17 GB range
+    #     and nothing else is written -- ~5 GB of slack on a 2.4 h run, i.e. an ENOSPC
+    #     coin flip late in training.
+    #     At max_to_keep=2 / keep_period=1_000 it is {1000,2000} union {2250,2400} = 4
+    #     checkpoints ~68 GB, ~98 GB total, ~52 GB of headroom.
+    #     vast_run/README.md gives the same advice independently ("drop max_to_keep to
+    #     2 if the checkpoint volume is tight") for exactly this full-rank reason.
+    #     If you free disk and want finer granularity back, keep_period=500 is the knob.
     #
     #   holdout_fraction=0.1 on teleop instead of an explicit index manifest.
     #     There is no vast_run/make_holdout.py run for this dataset yet, and
@@ -1564,8 +1581,8 @@ _CONFIGS = [
         batch_size=64,
         num_workers=16,
         save_interval=250,
-        max_to_keep=4,
-        keep_period=500,
+        max_to_keep=2,
+        keep_period=1_000,
         freeze_filter=pi0_config.Pi0Config(
             pi05=True,
             action_dim=32,
