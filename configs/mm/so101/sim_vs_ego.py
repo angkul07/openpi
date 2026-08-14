@@ -18,8 +18,8 @@ then asks whether more data helps once the ratio is already balanced.
 WHAT "5 MINUTES OF SIM" ACTUALLY MEANS HERE
     The client has 9 min 15 s of sim, not 10, so "10 minutes" is the whole pool and
     "5 minutes" is half of it. After the eval holdout comes out (10%), the full arms
-    train on 8.33 min and the half arm on 4.31 min. Those are the real numbers and they
-    are what the schedule is derived from.
+    train on 8.33 min and the half arm on 4.31 min. Those are the real numbers, and they
+    are what the epoch counts below are computed against.
 
 WHY THE DRAW IS 32/32 AND NOT SOMETHING PROPORTIONAL
     `samples_per_batch` is a hard per-batch count, so a source's gradient share is
@@ -39,23 +39,32 @@ WHY ALL THREE RUN THE SAME NUMBER OF STEPS
     loss to rank its arms at all. One `_SCHEDULE` object is shared by all three arms
     here so they cannot drift apart.
 
-    The length is derived, not chosen: 20 epochs over the full sim training pool at the
-    baseline arm's 64-per-batch draw, rounded to a round 100. Everything else follows.
+WHAT 2,400 STEPS BUYS, AND THE EPOCH SPREAD IT LEAVES
+    Roughly 154k samples per arm. The epochs each pool gets fall out of that and differ
+    per arm by design, because the arms differ in pool size:
 
-THE EPOCH COUNTS BREAK THE HOUSE RULE, DELIBERATELY -- READ THIS BEFORE THE RUN
-    Our own guidance is 1-3 epochs of a scarce pool and "past ~5 epochs of a small pool,
-    assume memorisation risk". These arms run 8 to 20. That guidance was calibrated on
-    250k-1M-frame multi-task pools where one epoch is already 4,000+ steps; here one
-    epoch of the whole dataset is 234 steps, so honouring it would mean a ~1,200-step
-    run that has barely left warmup. The two quantities that rule of thumb conflates --
-    steps (has the optimiser converged?) and epochs (am I memorising?) -- come apart
-    completely at this data scale, and on 9 minutes of single-task data steps is the one
-    that binds.
+        mm_pi05_sim10   sim 10.25
+        mm_pi05_mix10   sim/half 9.90   ego 8.44
+        mm_pi05_mix20   sim 5.12        ego 4.22
 
-    So the design accepts memorisation and moves the decision downstream: train past
-    convergence, save often, and let the holdout choose the checkpoint. That is the
-    standard answer for a narrow single-task finetune, and it is why 10% of a very small
-    pool is spent on `SIM_HOLDOUT_EPISODES`.
+    Note `sim10` at 10.25 and `mix10`'s sim half at 9.90 are nearly equal -- half the
+    draw on half the data. So those two arms give the sim pool the same number of
+    passes, and the only difference is that half of `mix10`'s gradient comes from ego
+    instead of from more sim. That is what makes the pair a clean A/B rather than two
+    runs that happen to have the same length.
+
+    Against our own guidance -- 1-3 epochs of a scarce pool, memorisation risk past
+    ~5 -- `mix20` sits just at the edge and the other two are about 2x over it. That is
+    a real cost accepted knowingly, and it is not fixable by shortening the run: that
+    guidance was calibrated on 250k-1M-frame multi-task pools where one epoch is already
+    thousands of steps, whereas here one epoch of the ENTIRE dataset is 234 steps. The
+    two things the rule conflates -- steps (has the optimiser converged?) and epochs (am
+    I memorising?) -- come apart completely at nine minutes of data, and obeying the
+    epoch band literally would mean a ~1,200-step run that has barely left warmup.
+
+    So the design moves the stopping decision downstream instead: save every 300 steps
+    and let the holdout choose the checkpoint. That is why 10% of a very small pool is
+    spent on `SIM_HOLDOUT_EPISODES`.
 
     What to actually look at, in order: holdout MSE per checkpoint (if it stalls or
     worsens while train loss keeps falling, ship the earlier checkpoint -- that is the
@@ -64,7 +73,8 @@ THE EPOCH COUNTS BREAK THE HOUSE RULE, DELIBERATELY -- READ THIS BEFORE THE RUN
     loss, since delta actions make t=0 nearly free.
 
     If the holdout says every arm peaked early, the fix is fewer steps and a re-run of
-    all three, never a shorter run of one -- they have to stay matched.
+    all three, never a shorter run of one -- they have to stay matched. The cosine is
+    spent at the end of a run, so a finished arm cannot usefully be extended either.
 
 BEFORE LAUNCHING, DO THE NORM-STATS PREFLIGHT (30 minutes, saves 9 hours)
     Per-dim p1/p50/p99 of `observation.state` and `action`, for the sim pool and the ego
@@ -120,16 +130,20 @@ BATCH_SIZE = 64
 # over BATCH_SIZE, independent of pool sizes.
 _MIX_DRAW = BATCH_SIZE // 2
 
-# 20 epochs over the full sim training pool at the baseline arm's 64-per-batch draw.
 # Shared by all three arms so their step counts and schedule positions cannot diverge.
-_SCHEDULE = Schedule.for_epochs(
-    frames=ds.SIM_TRAIN_FRAMES,
-    batch_size=BATCH_SIZE,
-    epochs=20.0,
-    round_to=100,
-    # ~5% of the run. The lower bound that matters is absolute, not fractional: Adam's
-    # second-moment estimates are unusable for the first few hundred steps, and our
-    # largest grad norms have always landed inside or just after warmup.
+#
+# `of_steps` rather than `for_epochs` because the run LENGTH is the thing being held
+# fixed here, not data exposure -- the three arms have different pool sizes, so no single
+# epoch target could describe all of them anyway. `describe()` reports the epochs each
+# arm actually gets.
+_SCHEDULE = Schedule.of_steps(
+    2_400,
+    # 10.4% of the run, which is high against the usual 2-5% -- kept anyway because the
+    # bound that matters here is ABSOLUTE, not fractional. The risky region is the first
+    # few hundred steps whatever the run length: freshly initialised LoRA B-matrices and
+    # projections produce their largest gradients there, and every FD run's peak grad
+    # norm has landed inside or just after warmup. Scaling this to 5% would put it at
+    # ~120, below the point where our own runs stopped spiking.
     warmup_steps=250,
 )
 
@@ -187,12 +201,15 @@ registry.register(
         asset_id="mm_sim10",
         schedule=_SCHEDULE,
         batch_size=BATCH_SIZE,
-        # ~9 selectable checkpoints. The whole design leans on picking one by holdout
-        # score rather than taking the last, so a rolling window of 4 is too few; every
-        # 1000th is pinned on top of the window so the early part of the curve survives.
-        save_interval=500,
-        max_to_keep=5,
-        keep_period=1_000,
+        # 8 checkpoints written, 6 kept: the rolling window holds 1500-2400 and
+        # `keep_period` pins 600 and 1200 on top of it, so the curve is sampled across
+        # the WHOLE run and not just its tail. That matters because the whole design
+        # leans on picking a checkpoint by holdout score rather than taking the last
+        # one, and at ~10 epochs the knee can easily land in the first half. Six pi0.5
+        # checkpoints is the disk cost of being able to see it.
+        save_interval=300,
+        max_to_keep=4,
+        keep_period=600,
     ),
     pi05_arm(
         "mm_pi05_mix10",
@@ -205,9 +222,9 @@ registry.register(
         # is looked up. Pinned to sim on both mixture arms so all three arms agree, and
         # so it does not silently follow `sources[0]`.
         repo_id=ds.SIM_REPO,
-        save_interval=500,
-        max_to_keep=5,
-        keep_period=1_000,
+        save_interval=300,
+        max_to_keep=4,
+        keep_period=600,
     ),
     pi05_arm(
         "mm_pi05_mix20",
@@ -217,9 +234,9 @@ registry.register(
         schedule=_SCHEDULE,
         batch_size=BATCH_SIZE,
         repo_id=ds.SIM_REPO,
-        save_interval=500,
-        max_to_keep=5,
-        keep_period=1_000,
+        save_interval=300,
+        max_to_keep=4,
+        keep_period=600,
     ),
 )
 

@@ -153,9 +153,9 @@ on a single-arm SO-101 doing *"pick up the cube and place it in the tray"*.
 
 | Config | Pools | Draw (sim/ego) | Steps | Asks |
 | --- | --- | --- | --- | --- |
-| `mm_pi05_sim10` | sim only, 8.33 min | 64 / — | 4,700 | The baseline. |
-| `mm_pi05_mix10` | 4.31 min sim + ~5 min ego | 32/32 | 4,700 | **Replace** half the sim with ego at a fixed data budget. |
-| `mm_pi05_mix20` | 8.33 min sim + ~10 min ego | 32/32 | 4,700 | **Add** ego on top — double the data at fixed compute. |
+| `mm_pi05_sim10` | sim only, 8.33 min | 64 / — | 2,400 | The baseline. |
+| `mm_pi05_mix10` | 4.31 min sim + ~5 min ego | 32/32 | 2,400 | **Replace** half the sim with ego at a fixed data budget. |
+| `mm_pi05_mix20` | 8.33 min sim + ~10 min ego | 32/32 | 2,400 | **Add** ego on top — double the data at fixed compute. |
 
 `sim10` vs `mix10` is the clean A/B: same total minutes, same steps, same schedule, same
 holdout, composition the only moving part. All three share one `Schedule` object, so
@@ -164,13 +164,14 @@ ranking its own arms on training loss.
 
 Three things here are worth knowing outside the module:
 
-- **The epoch counts (8–20) break the house 1–3 rule on purpose.** That rule was
-  calibrated on 250k–1M-frame multi-task pools where one epoch is thousands of steps;
-  here one epoch of the entire dataset is 234 steps, so honouring it would mean a run
-  that has barely left warmup. Steps and epochs come apart completely at this data
-  scale. The design accepts memorisation and moves the decision downstream — train past
-  convergence, save every 500, and let a 5-episode holdout pick the checkpoint. That is
-  why 10% of a very small pool is spent on `SIM_HOLDOUT_EPISODES`.
+- **The epoch counts run 4–10, against a house rule of 1–3.** `mix20` (5.12 sim / 4.22
+  ego) sits at the edge of the band; `sim10` and `mix10` are about 2× over it. That is a
+  cost taken knowingly, not an oversight, and shortening the run does not fix it: the
+  rule was calibrated on 250k–1M-frame multi-task pools where one epoch is thousands of
+  steps, whereas here one epoch of the entire dataset is 234. Steps and epochs come
+  apart completely at this data scale. So the stopping decision moves downstream — save
+  every 300, and let a 5-episode holdout pick the checkpoint. That is why 10% of a very
+  small pool is spent on `SIM_HOLDOUT_EPISODES`.
 - **Neither pool is trainable as it stands.** The sim dataset is LeRobot **v3.0** and
   openpi's pinned lerobot is v2.1-only (`check_version_compatibility` raises), so it
   needs a down-conversion; the ego pool is still raw video with *no action stream* and
