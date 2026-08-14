@@ -80,6 +80,24 @@ class RobotSpec:
     state_feature: str = "observation.state"
     action_feature: str = "action"
 
+    # Control frequency the datasets for this robot are expected to be recorded at.
+    #
+    # NOTHING IN openpi MODELS TIME. `action_horizon` counts STEPS, not seconds, and
+    # `_create_lerobot_dataset` builds `delta_timestamps` from each source's OWN fps.
+    # So a 50-step chunk is 1.67 s of future at 30 Hz and 2.5 s at 20 Hz, under
+    # identical conditioning and with no warning. Mixing two rates in one mixture also
+    # blends two delta-action distributions into one set of norm stats: at 20 Hz the
+    # per-step displacement for the same physical velocity is 1.5x the 30 Hz one.
+    #
+    # Declaring it here makes the data loader check it (see `DataConfig.expected_fps`),
+    # so a dataset that is not what you think fails loudly instead of training.
+    # Leave None to skip that check -- cross-source agreement within a mixture is
+    # still enforced either way.
+    #
+    # To train one arm on data at a different rate, override per config rather than
+    # weakening the spec:  robot=dataclasses.replace(YAM, control_hz=25.0)
+    control_hz: float | None = None
+
     def __post_init__(self) -> None:
         if len(self.cameras) != len(_model.IMAGE_KEYS):
             raise ValueError(
@@ -100,6 +118,19 @@ class RobotSpec:
             )
         if self.arms < 1 or self.joints_per_arm < 1:
             raise ValueError(f"{self.name}: arms and joints_per_arm must be >= 1.")
+        if self.control_hz is not None and self.control_hz <= 0:
+            raise ValueError(f"{self.name}: control_hz must be positive, got {self.control_hz}.")
+
+    def chunk_duration_s(self, action_horizon: int) -> float | None:
+        """How much wall-clock future an `action_horizon`-step chunk covers.
+
+        This is the number `action_horizon` actually means, and it is the one that
+        should match across arms you intend to compare. None when `control_hz` is
+        undeclared.
+        """
+        if self.control_hz is None:
+            return None
+        return action_horizon / self.control_hz
 
     @property
     def dofs_per_arm(self) -> int:

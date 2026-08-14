@@ -1,6 +1,7 @@
 import bisect
 from collections.abc import Iterator, Sequence
 import logging
+import math
 import multiprocessing
 import os
 import typing
@@ -18,6 +19,11 @@ from openpi.training.droid_rlds_dataset import DroidRldsDataset
 import openpi.transforms as _transforms
 
 T_co = TypeVar("T_co", covariant=True)
+
+# How close two control frequencies must be to count as the same rate. 0.5% admits
+# NTSC-style 29.97 vs 30.0 (0.1% apart) while still separating every pair of rates
+# that are genuinely different -- 20/24/25/30/50 are all >= 4% apart.
+_FPS_REL_TOL = 5e-3
 
 
 class Dataset(Protocol[T_co]):
@@ -234,10 +240,30 @@ def _create_lerobot_dataset(
     holdout_fraction: float = 0.0,
     holdout_seed: int = 0,
     skip_videos: bool = False,
-) -> Dataset:
-    """Create one LeRobot dataset, optionally excluding a validation episode split."""
+) -> tuple[Dataset, float]:
+    """Create one LeRobot dataset, optionally excluding a validation episode split.
+
+    Returns the dataset and its control frequency, so the caller can check that every
+    source in a mixture agrees (see `create_torch_dataset`).
+    """
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id, root=root)
     total_episodes = dataset_meta.total_episodes
+    fps = float(dataset_meta.fps)
+
+    # `action_horizon` counts STEPS, and `delta_timestamps` below turns them into
+    # seconds using THIS dataset's fps -- so a dataset recorded at an unexpected rate
+    # silently changes how much future a chunk covers. Check it against what the robot
+    # spec declared rather than finding out from a training curve.
+    if data_config.expected_fps is not None and not math.isclose(fps, data_config.expected_fps, rel_tol=_FPS_REL_TOL):
+        raise ValueError(
+            f"[{repo_id}] is recorded at {fps} fps, but the robot spec declares "
+            f"{data_config.expected_fps} fps. An {action_horizon}-step action chunk would cover "
+            f"{action_horizon / fps:.2f} s here against the intended "
+            f"{action_horizon / data_config.expected_fps:.2f} s.\n"
+            "Either the dataset is not what you think, or the spec is stale. To train on this rate "
+            "deliberately, override it for this config: robot=dataclasses.replace(SPEC, control_hz="
+            f"{fps})."
+        )
 
     held_out = {int(ep) for ep in exclude_episodes}
     out_of_range = sorted(ep for ep in held_out if not 0 <= ep < total_episodes)
@@ -272,7 +298,7 @@ def _create_lerobot_dataset(
         # Task strings are per-dataset, so this must be applied per source.
         dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
 
-    return dataset
+    return dataset, fps
 
 
 def create_torch_dataset(
@@ -290,7 +316,7 @@ def create_torch_dataset(
         return FakeDataset(model_config, num_samples=1024)
 
     if data_config.mixture:
-        datasets = [
+        built = [
             _create_lerobot_dataset(
                 source.repo_id,
                 root=source.root,
@@ -303,19 +329,54 @@ def create_torch_dataset(
             )
             for source in data_config.mixture
         ]
+        datasets = [dataset for dataset, _ in built]
+        _assert_uniform_fps(data_config.mixture, [fps for _, fps in built], action_horizon)
+
         mixture = MixtureDataset(datasets, [s.repo_id for s in data_config.mixture])
-        for source, size in zip(data_config.mixture, mixture.sizes, strict=True):
+        for (source, size), (_, fps) in zip(
+            zip(data_config.mixture, mixture.sizes, strict=True), built, strict=True
+        ):
             logging.info(
-                f"mixture source {source.repo_id}: {size} train frames, {source.samples_per_batch} samples/batch"
+                f"mixture source {source.repo_id}: {size} train frames, "
+                f"{source.samples_per_batch} samples/batch, {fps:g} fps "
+                f"({action_horizon / fps:.2f} s per {action_horizon}-step chunk)"
             )
         return mixture
 
-    return _create_lerobot_dataset(
+    dataset, _ = _create_lerobot_dataset(
         repo_id,
         root=None,
         action_horizon=action_horizon,
         data_config=data_config,
         skip_videos=skip_videos,
+    )
+    return dataset
+
+
+def _assert_uniform_fps(sources: Sequence[_config.MixtureSource], rates: Sequence[float], action_horizon: int) -> None:
+    """Every source in a mixture must be recorded at the same rate.
+
+    They share one set of transforms, one set of norm stats and one `action_horizon`,
+    but `delta_timestamps` is built from each source's OWN fps. Mixing rates therefore
+    means the same conditioning maps to action chunks covering different amounts of
+    wall-clock future, and the delta-action magnitudes for a given physical velocity
+    differ between sources while being normalised as one distribution. Nothing errors
+    and nothing looks wrong in the loss.
+    """
+    # Tolerance, not exact equality: a dataset recorded at 29.97 and one at 30.0 are
+    # the same rate for this purpose, and flagging them would be noise.
+    if all(math.isclose(fps, rates[0], rel_tol=_FPS_REL_TOL) for fps in rates):
+        return
+    detail = "\n".join(
+        f"  {source.repo_id}: {fps:g} fps -> {action_horizon / fps:.2f} s per chunk"
+        for source, fps in zip(sources, rates, strict=True)
+    )
+    raise ValueError(
+        "mixture sources are recorded at different control frequencies:\n"
+        f"{detail}\n"
+        "They share one action_horizon, one set of transforms and one set of norm stats, so this "
+        "silently mixes two different notions of 'the next 50 steps' and two delta-action scales. "
+        "Resample the sources to a common rate at conversion time."
     )
 
 

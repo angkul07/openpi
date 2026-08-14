@@ -133,6 +133,14 @@ class DataConfig:
     # If true, will use the LeRobot dataset task to define the prompt.
     prompt_from_task: bool = False
 
+    # Control frequency every source is expected to be recorded at, from
+    # `RobotSpec.control_hz`. The data loader checks each dataset's actual fps against
+    # it and raises on a mismatch. None skips that check; cross-source agreement
+    # within a mixture is enforced regardless. Nothing else in openpi models time --
+    # `action_horizon` counts steps, so the same chunk spans a different duration at a
+    # different rate.
+    expected_fps: float | None = None
+
     # Only used for RLDS data loader (ie currently only used for DROID).
     rlds_data_dir: str | None = None
     # Action space for DROID dataset.
@@ -541,6 +549,7 @@ class LeRobotRobotDataConfig(DataConfigFactory):
             # openpi defaults to "actions" (LIBERO's converted name) -> KeyError, so
             # tell LeRobot the real column name for the temporal action chunk.
             action_sequence_keys=(spec.action_feature,),
+            expected_fps=spec.control_hz,
         )
 
 

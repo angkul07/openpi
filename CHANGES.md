@@ -209,10 +209,15 @@ client slug, and registration raises on any collision.
   so a new client's arms need the experiment name passed explicitly as `$2`.
 - `LeRobotYamDataConfig` was robot-parameterised — see the row above. What remains
   embodiment-specific and is *not* yet in `RobotSpec`: the assumption of an arm-major
-  `[joints..., gripper]` state layout (a dataset with different **per-arm** structure
+  `[joints..., gripper]` state layout. A dataset with different **per-arm** structure
   still needs its own mask; a right-arm-first layout is fine, since the mask is
-  symmetric across arms), and control frequency, which nothing in the config models —
-  the 20 Hz Piper data and the 30 Hz YAM data are indistinguishable to openpi.
+  symmetric across arms.
+
+  Control frequency **is** now modelled — `RobotSpec.control_hz`, checked against every
+  dataset's actual fps at load time, with cross-source agreement enforced inside a
+  mixture. openpi still has no notion of time itself (`action_horizon` counts steps and
+  `delta_timestamps` is built per source from that source's fps), so the fix is to make
+  the rate declared and verified rather than to resample.
 
   Image resolution is **not** on this list. `IMAGE_RESOLUTION = (224, 224)` is
   openpi's own model-level constant (`models/model.py`), and `preprocess_observation`

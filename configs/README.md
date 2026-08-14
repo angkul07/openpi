@@ -97,6 +97,20 @@ registry.register(
 )
 ```
 
+What the builders refuse, because each has cost real time:
+
+- per-source draws that do not sum to `batch_size` — the sampler would only assert
+  this much later, on the box;
+- a mixture with no `asset_id` of its own — it falls back to `repo_id`, and two
+  mixtures over the same primary dataset would then share, and silently corrupt, one
+  set of norm stats;
+- `decay_steps` disagreeing with `num_train_steps` — not possible, `Schedule` derives
+  it. openpi defaults `decay_steps` to 30k independently of run length, so a short run
+  otherwise never finishes decaying.
+
+Put the *reasoning* in the module docstring, next to the arm. That is the whole point
+of the file existing.
+
 ## Adding a robot
 
 `robot=` is a `RobotSpec`: the embodiment stated once. The repack map, the delta
@@ -131,24 +145,19 @@ Two rules the spec enforces, both learned the hard way:
   embeds every image and applies masks only to the attention mask. Neither skips the
   video decode; only not writing the key at conversion time does that.
 
+**Declare `control_hz`.** Nothing in openpi models time: `action_horizon` counts
+*steps*, and `delta_timestamps` is built from each source's own fps. So a 50-step chunk
+is 1.67 s of future at 30 Hz and 2.5 s at 20 Hz, under identical conditioning. Two arms
+at the same `action_horizon` on differently-sampled data are therefore **not**
+comparable. Declaring the rate makes the loader check each dataset's real fps against
+it, and a mixture whose sources disagree now raises instead of silently blending two
+delta-action scales into one set of norm stats. Override per config rather than
+weakening the spec: `robot=dataclasses.replace(YAM, control_hz=25.0)`.
+
 And one thing to check before trusting any of it: **verify what the cameras actually
 see.** On the Piper H rig the stored key names did not describe the content (`front`
 was top-down, `top` was sideways), which was only found by extracting frames and
 looking.
-
-What the builders refuse, because each has cost real time:
-
-- per-source draws that do not sum to `batch_size` — the sampler would only assert
-  this much later, on the box;
-- a mixture with no `asset_id` of its own — it falls back to `repo_id`, and two
-  mixtures over the same primary dataset would then share, and silently corrupt, one
-  set of norm stats;
-- `decay_steps` disagreeing with `num_train_steps` — not possible, `Schedule` derives
-  it. openpi defaults `decay_steps` to 30k independently of run length, so a short run
-  otherwise never finishes decaying.
-
-Put the *reasoning* in the module docstring, next to the arm. That is the whole point
-of the file existing.
 
 ## Norm stats are fingerprinted
 

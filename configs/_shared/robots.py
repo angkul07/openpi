@@ -35,6 +35,15 @@ YAM = RobotSpec(
     arms=2,
     joints_per_arm=6,
     gripper_per_arm=True,
+    # 30 Hz. Verified against every YAM dataset we train on, from frames/hours in
+    # meta/info.json: abc-teleop 7h subset 251,703 / 2.331 h, ego multiview
+    # 1,074,893 / 9.953 h, abc-ego screwdriver 730,496 / 6.76 h, 50/50 merge
+    # 755,964 / 7.00 h -- all 30.0.
+    # NOT verified for the legacy `Kavin60606/yam_pi0fast_train` set behind the two
+    # pi0_fast_yam arms; if it turns out to differ the loader will say so on the box,
+    # and the fix is a per-config dataclasses.replace(YAM, control_hz=...).
+    # A 50-step chunk is 1.67 s of future here.
+    control_hz=30.0,
 )
 
 
@@ -76,4 +85,10 @@ PIPER_H = RobotSpec(
     arms=2,
     joints_per_arm=6,
     gripper_per_arm=True,
+    # 20 Hz on BOTH halves -- ego 47,953 frames / 39.96 min and teleop 25,075 / 20.90
+    # min both work out to 20.0. This is the one place the rate differs from the YAM
+    # work, and it is why the constant is declared rather than assumed: a 50-step
+    # chunk is 2.5 s of future here against YAM's 1.67 s, so the two are NOT
+    # comparable at equal action_horizon even though the number looks the same.
+    control_hz=20.0,
 )
