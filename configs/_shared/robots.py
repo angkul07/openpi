@@ -92,3 +92,42 @@ PIPER_H = RobotSpec(
     # comparable at equal action_horizon even though the number looks the same.
     control_hz=20.0,
 )
+
+
+# ---------------------------------------------------------------------------
+# SO-101 -- 6-DoF SINGLE arm, 2 real cameras
+# ---------------------------------------------------------------------------
+# The first single-arm spec here, and the first with fewer than 6 joints. Both fall out
+# of `arms`/`joints_per_arm` with no special-casing:
+#
+#     action_dim = 1 * (5 + 1)           = 6
+#     delta mask = make_bool_mask(5, -1) = (T,T,T,T,T,F)
+#
+# 5 arm DOF, NOT 6. The columns are `shoulder_pan, shoulder_lift, elbow_flex,
+# wrist_flex, wrist_roll, gripper` -- there is no shoulder_roll. Worth stating because
+# the dt-pipeline's retargeting stages M3-M6 still assume 6 joints + gripper and emit a
+# (T,12) two-arm frame with the left half parked, so whatever converts that to LeRobot
+# has to slice the 6 real columns out and order them as above. The SO-101 URDF's own
+# joint order is reverse-kinematic (`wrist_roll ... shoulder_pan`), i.e. exactly
+# backwards from the column order, so a retargeted source that skips the remap is not
+# merely miscalibrated -- it is joint-reversed, and normalisation cannot recover it.
+#
+# Slot 1 holds the wrist camera and slot 2 is padding, per the leading-slots rule in
+# `openpi.policies.robot_policy`. This is the DROID/libero occupancy pattern.
+#
+# 30 Hz, read from `meta/info.json` of
+# `makermods/maniskill_50ep_so101_blue_cube_orange_tray_20260812_131142`
+# (16,658 frames / 50 episodes / fps 30). A 50-step chunk is 1.67 s of future, the same
+# as YAM -- so action_horizon IS comparable across those two, unlike Piper H.
+SO101 = RobotSpec(
+    name="so101",
+    cameras=(
+        "observation.images.front",  # -> base_0_rgb
+        "observation.images.wrist",  # -> left_wrist_0_rgb
+        None,  # padding slot
+    ),
+    arms=1,
+    joints_per_arm=5,
+    gripper_per_arm=True,
+    control_hz=30.0,
+)

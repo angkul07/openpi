@@ -89,6 +89,12 @@ def test_expected_fps_is_none_when_the_spec_does_not_declare_one():
 
 
 def test_the_shipped_specs_declare_their_measured_rates():
+    # `configs` only goes on sys.path when discovery runs; without this the test passes
+    # or fails depending on whether an earlier test called get_config() first.
+    from openpi.training import registry
+
+    registry.discover()
+
     from configs._shared.robots import PIPER_H
     from configs._shared.robots import YAM
 

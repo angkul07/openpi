@@ -15,13 +15,19 @@ configs/
   _shared/          helpers, not arms. Leading underscore = never scanned.
     arms.py         pi05_arm() / pi0_fast_arm() builders + their validation
     schedule.py     Schedule: step counts and LR schedules, computed not commented
-    robots.py       RobotSpec per embodiment (YAM, PIPER_H)
+    robots.py       RobotSpec per embodiment (YAM, PIPER_H, SO101)
   _template/        skeleton to copy for a new client
   fd/               one directory per client (fd = our own internal R&D)
     datasets.py     that client's roots, repo ids, frame counts, holdout indices
     teleop_holdout.json
     yam/            one directory per robot, when a client has more than one
       mix_7h.py     an experiment: its arms, and why they are what they are
+  mm/               a real client, laid out the same way
+    datasets.py
+    sim_splits.json      generated split manifest, checked in so it travels with the code
+    make_sim_splits.py   regenerates it
+    so101/
+      sim_vs_ego.py
 ```
 
 Anything whose path contains a component starting with `_` is skipped by the scanner
@@ -119,8 +125,13 @@ from it, so a new robot is a data change, not a new `<name>_policy.py` plus a ne
 `LeRobot<Name>DataConfig` (which is what it used to be — the YAM and Piper versions of
 those were ~95% identical and drifted independently).
 
-Check `configs/_shared/robots.py` first; a spec is reusable across clients. For a
+Check `configs/_shared/robots.py` first; a spec is reusable across clients — `SO101` is
+an off-the-shelf arm and lives there rather than under `mm/` for that reason. For a
 genuinely bespoke rig, copy `configs/_template/robots.py`.
+
+Arm count and joint count are ordinary fields, not special cases. `SO101` is a
+single-arm 5-joint robot and gets `action_dim=6` with a `(5, −1)` delta mask purely from
+`arms=1, joints_per_arm=5`.
 
 ```python
 PIPER_H = RobotSpec(
