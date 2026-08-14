@@ -20,6 +20,7 @@ budget, and E-A vs E-C is BUDGET at a fixed ratio.
 """
 
 from configs._shared.arms import pi0_fast_arm
+from configs._shared.robots import YAM
 from configs._shared.schedule import Schedule
 from configs.fd import datasets as ds
 from openpi.training import registry
@@ -65,6 +66,7 @@ for _name, _asset_id, _teleop_per_batch, _schedule in _ARMS:
     registry.register(
         pi0_fast_arm(
             _name,
+            robot=YAM,
             sources=_sources(_teleop_per_batch),
             # Per-ratio norm stats. p50 and p625 draw different distributions through
             # the same sampler, so they cannot share an asset id.

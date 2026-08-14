@@ -66,7 +66,8 @@ def _color_jitter(config: "ImageAugmentConfig"):
     Cached because the transform is pickled into each spawned dataloader worker;
     we only want to pay construction once per worker process.
     """
-    from torchvision.transforms import v2  # noqa: PLC0415  (heavy import, workers only)
+    # Imported lazily: heavy, and only needed inside dataloader workers.
+    from torchvision.transforms import v2
 
     return v2.ColorJitter(
         brightness=config.brightness,
@@ -78,7 +79,7 @@ def _color_jitter(config: "ImageAugmentConfig"):
 
 def _sample_crop(height: int, width: int, crop_scale: tuple[float, float]):
     """Sample a square crop box covering `crop_scale` of the area (torch RNG)."""
-    import torch  # noqa: PLC0415
+    import torch  # lazy: heavy, workers only
 
     lo, hi = crop_scale
     scale = float(torch.empty(1).uniform_(lo, hi).item())
@@ -91,11 +92,11 @@ def _sample_crop(height: int, width: int, crop_scale: tuple[float, float]):
 
 def _augment_image(image: np.ndarray, *, geometric: bool, config: ImageAugmentConfig) -> np.ndarray:
     """Augment a single HWC uint8 image and return it in the same layout/dtype."""
-    import torch  # noqa: PLC0415
-    from torchvision.transforms.v2 import functional as tv_f  # noqa: PLC0415
+    import torch  # lazy: heavy, workers only
+    from torchvision.transforms.v2 import functional as tv_f
 
     if image.dtype != np.uint8:
-        # Everything upstream (YamInputs._parse_image) hands us uint8; fail loudly
+        # Everything upstream (RobotInputs._parse_image) hands us uint8; fail loudly
         # rather than silently mangling a float image's range.
         raise ValueError(f"ImageAugment expects uint8 images, got {image.dtype}")
 

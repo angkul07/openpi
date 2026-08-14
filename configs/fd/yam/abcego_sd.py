@@ -6,7 +6,7 @@ Single task string, so `prompt` carries no discriminative signal -- expected for
 single-task finetune, but it does mean language is doing nothing here.
 
 A MIXTURE OF ONE, DELIBERATELY
-    100% teleop is one source, so the plain single-source `LeRobotYamDataConfig` looks
+    100% teleop is one source, so the plain single-source `LeRobotRobotDataConfig` looks
     like the obvious choice. It is the wrong one, for two mechanical reasons:
       1. `create_torch_dataset()` hardcodes root=None on the non-mixture path, so the
          dataset would have to live at `$HF_LEROBOT_HOME/<repo_id>` and be symlinked
@@ -47,6 +47,7 @@ batch_size 64 assumes 80GB-class hardware, as measured for the pi05_yam7h arms
 """
 
 from configs._shared.arms import pi05_arm
+from configs._shared.robots import YAM
 from configs._shared.schedule import Schedule
 from configs.fd import datasets as ds
 from openpi.training import registry
@@ -66,6 +67,7 @@ SCHEDULE = Schedule.for_epochs(
 registry.register(
     pi05_arm(
         "pi05_abcego_sd",
+        robot=YAM,
         sources=(
             _config.MixtureSource(
                 repo_id=ds.ABCEGO_SD_REPO,

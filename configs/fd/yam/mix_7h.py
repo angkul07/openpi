@@ -58,6 +58,7 @@ THE pi05 TWINS
 
 from configs._shared.arms import pi0_fast_arm
 from configs._shared.arms import pi05_arm
+from configs._shared.robots import YAM
 from configs._shared.schedule import Schedule
 from configs.fd import datasets as ds
 from openpi.training import registry
@@ -113,6 +114,7 @@ for _suffix, _asset_id, _teleop_per_batch, _schedule in _ARMS:
     registry.register(
         pi0_fast_arm(
             f"pi0_fast_yam7h_{_suffix}",
+            robot=YAM,
             sources=_srcs,
             asset_id=_asset_id,
             schedule=_schedule,
@@ -121,6 +123,7 @@ for _suffix, _asset_id, _teleop_per_batch, _schedule in _ARMS:
         ),
         pi05_arm(
             f"pi05_yam7h_{_suffix}",
+            robot=YAM,
             sources=_srcs,
             asset_id=_asset_id,
             schedule=_schedule,

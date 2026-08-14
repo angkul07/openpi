@@ -17,7 +17,7 @@ import openpi.models.model as _model
 import openpi.models.pi0_config as pi0_config
 import openpi.models.pi0_fast as pi0_fast
 import openpi.models.tokenizer as _tokenizer
-from openpi.policies import yam_policy
+from openpi.policies import robot_policy
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
@@ -479,48 +479,52 @@ class RLDSDroidDataConfig(DataConfigFactory):
 
 
 @dataclasses.dataclass(frozen=True)
-class LeRobotYamDataConfig(DataConfigFactory):
-    # YAM stores ABSOLUTE actions, so convert the arm-joint dims to deltas
-    # (relative to current state); grippers stay absolute. This matches how pi0 is
-    # trained and mirrors ALOHA's `use_delta_joint_actions`. Set False only if your
+class LeRobotRobotDataConfig(DataConfigFactory):
+    """LeRobot data config for any robot described by a `RobotSpec`.
+
+    Everything embodiment-specific -- camera keys, which slots are real, joint layout,
+    dataset column names -- comes from `robot`. This used to be one hardcoded class per
+    robot (`LeRobotYamDataConfig`, `LeRobotPiperDataConfig`), which were ~95% identical
+    and drifted independently.
+    """
+
+    # The embodiment. Required in practice; see `configs/_shared/robots.py` for ours.
+    robot: tyro.conf.Suppress[robot_policy.RobotSpec | None] = None
+
+    # Most of these datasets store ABSOLUTE actions, so convert the arm-joint dims to
+    # deltas (relative to current state); grippers stay absolute. This matches how pi0
+    # is trained and mirrors ALOHA's `use_delta_joint_actions`. Set False only if your
     # dataset already stores delta actions (like LIBERO).
     use_delta_joint_actions: bool = True
 
+    def _spec(self) -> robot_policy.RobotSpec:
+        if self.robot is None:
+            raise ValueError(
+                f"{type(self).__name__} needs a `robot=` RobotSpec describing the embodiment "
+                "(cameras, joint layout, dataset column names). See configs/_shared/robots.py."
+            )
+        return self.robot
+
     @override
     def create(self, assets_dirs, model_config):
-        # Rename raw LeRobot dataset keys -> intermediate keys used by YamInputs.
-        # LEFT = target key (what YamInputs reads), RIGHT = your dataset feature name.
-        repack_transform = _transforms.Group(
-            inputs=[
-                _transforms.RepackTransform(
-                    {
-                        "observation/top_image": "observation.images.top",
-                        "observation/left_wrist_image": "observation.images.left_wrist",
-                        "observation/right_wrist_image": "observation.images.right_wrist",
-                        "observation/state": "observation.state",
-                        "actions": "action",
-                        # prompt_from_task adds "prompt" BEFORE this repack; it must
-                        # be listed here or RepackTransform drops it -> "Prompt is required".
-                        "prompt": "prompt",
-                    }
-                )
-            ]
-        )
+        spec = self._spec()
+
+        # LEFT = intermediate key RobotInputs reads, RIGHT = LeRobot feature name.
+        # A camera absent from the spec is absent here, and RepackTransform discards
+        # any key it does not list -- that is the mechanism for dropping a camera.
+        repack_transform = _transforms.Group(inputs=[_transforms.RepackTransform(spec.repack_map())])
 
         data_transforms = _transforms.Group(
-            inputs=[yam_policy.YamInputs(model_type=model_config.model_type)],
-            outputs=[yam_policy.YamOutputs()],
+            inputs=[robot_policy.RobotInputs(spec=spec, model_type=model_config.model_type)],
+            outputs=[robot_policy.RobotOutputs(spec=spec)],
         )
 
-        # ABSOLUTE -> DELTA conversion. YAM stores ABSOLUTE actions but pi0 trains
-        # on deltas, so subtract the current state from the arm-joint dims. The mask
-        # make_bool_mask(6, -1, 6, -1) = [6 joints -> delta, 1 gripper -> absolute]
-        # per arm (14 dims total), same as ALOHA. At inference AbsoluteActions adds
-        # the state back. ASSUMES the action/state layout is:
-        #   [arm0: 6 joints, arm0 gripper, arm1: 6 joints, arm1 gripper]
-        # If your ordering differs, change the mask accordingly.
+        # ABSOLUTE -> DELTA conversion: subtract the current state from the arm-joint
+        # dims, leaving grippers absolute. At inference AbsoluteActions adds the state
+        # back. The mask is derived from the spec's joint layout; see
+        # `RobotSpec.delta_action_mask` for the layout it assumes.
         if self.use_delta_joint_actions:
-            delta_action_mask = _transforms.make_bool_mask(6, -1, 6, -1)
+            delta_action_mask = spec.delta_action_mask()
             data_transforms = data_transforms.push(
                 inputs=[_transforms.DeltaActions(delta_action_mask)],
                 outputs=[_transforms.AbsoluteActions(delta_action_mask)],
@@ -533,21 +537,21 @@ class LeRobotYamDataConfig(DataConfigFactory):
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
-            # Our YAM dataset's action column is "action" (singular), like ALOHA.
-            # openpi defaults to "actions" (LIBERO's converted name) -> KeyError,
-            # so tell LeRobot the real column name for the temporal action chunk.
-            action_sequence_keys=("action",),
+            # These datasets name the action column "action" (singular), like ALOHA.
+            # openpi defaults to "actions" (LIBERO's converted name) -> KeyError, so
+            # tell LeRobot the real column name for the temporal action chunk.
+            action_sequence_keys=(spec.action_feature,),
         )
 
 
 @dataclasses.dataclass(frozen=True)
-class LeRobotYamMixtureDataConfig(LeRobotYamDataConfig):
-    """YAM data config that samples from several LeRobot datasets at a fixed ratio.
+class LeRobotRobotMixtureDataConfig(LeRobotRobotDataConfig):
+    """Robot data config that samples from several LeRobot datasets at a fixed ratio.
 
-    Used for the teleop-oversampling experiment: the two source datasets are stored
-    at ~33% teleop / 67% ego by frames, but training draws a fixed number of samples
-    per source per batch (e.g. 32/32), so teleop's gradient share is set explicitly
-    and independently of how much of it there is on disk. There is deliberately no
+    Used for the teleop-oversampling experiments: the source datasets may be stored at
+    any ratio by frames, but training draws a fixed number of samples per source per
+    batch (e.g. 32/32), so a source's gradient share is set explicitly and
+    independently of how much of it there is on disk. There is deliberately no
     per-source loss weighting -- sampling is the single lever.
 
     All sources share this config's repack/data transforms, so they must share a

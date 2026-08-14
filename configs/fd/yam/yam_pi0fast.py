@@ -1,7 +1,7 @@
 """The two original single-source YAM pi0-FAST arms.
 
 These predate the mixture work: one dataset, no `MixtureSource`, so they use
-`LeRobotYamDataConfig` directly and do not go through `configs/_shared/arms.py`.
+`LeRobotRobotDataConfig` directly and do not go through `configs/_shared/arms.py`.
 They are kept because the LoRA arm is the baseline every later number is quoted
 against, not because either is a recommended starting point today.
 
@@ -11,6 +11,7 @@ knob on the non-mixture path.
 """
 
 from configs._shared.arms import PI0_FAST_BASE
+from configs._shared.robots import YAM
 from configs._shared.schedule import Schedule
 import openpi.models.pi0_fast as pi0_fast
 from openpi.training import registry
@@ -20,8 +21,9 @@ import openpi.training.weight_loaders as weight_loaders
 _REPO = "Kavin60606/yam_pi0fast_train"
 
 
-def _data() -> _config.LeRobotYamDataConfig:
-    return _config.LeRobotYamDataConfig(
+def _data() -> _config.LeRobotRobotDataConfig:
+    return _config.LeRobotRobotDataConfig(
+        robot=YAM,
         repo_id=_REPO,
         base_config=_config.DataConfig(prompt_from_task=True),
     )

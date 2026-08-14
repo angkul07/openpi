@@ -51,6 +51,7 @@ LeRobot side; only the recipe is shared.
 """
 
 from configs._shared.arms import pi05_arm
+from configs._shared.robots import YAM
 from configs._shared.schedule import Schedule
 from configs.fd import datasets as ds
 from openpi.training import registry
@@ -65,6 +66,7 @@ SCHEDULE = Schedule.of_steps(17_700, warmup_steps=350)
 registry.register(
     pi05_arm(
         "pi05_50run_ea",
+        robot=YAM,
         sources=(
             _config.MixtureSource(
                 repo_id=ds.RUN50_REPO,

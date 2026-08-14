@@ -42,6 +42,7 @@ pi05_50run_ea at the same batch size, architecture and camera count.
 """
 
 from configs._shared.arms import pi05_arm
+from configs._shared.robots import YAM
 from configs._shared.schedule import Schedule
 from configs.fd import datasets as ds
 from openpi.training import registry
@@ -81,6 +82,7 @@ SOURCES = (
 registry.register(
     pi05_arm(
         "pi05_yam1090_ea",
+        robot=YAM,
         sources=SOURCES,
         asset_id="yam1090_p375",
         schedule=SCHEDULE,

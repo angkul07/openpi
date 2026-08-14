@@ -19,6 +19,7 @@ first time someone edits `batch_size`.
 """
 
 from configs._shared.arms import pi05_arm
+from configs._shared.robots import YAM  # -> your client's spec, see configs/_template/robots.py
 from configs._shared.schedule import Schedule
 from configs._template import datasets as ds  # -> `from configs.<client> import datasets as ds`
 from openpi.training import registry
@@ -64,6 +65,8 @@ SOURCES = (
 registry.register(
     pi05_arm(
         "client_pi05_ea",
+        # The embodiment: cameras, joint layout, dataset column names.
+        robot=YAM,
         sources=SOURCES,
         # Per-mixture norm stats. Never share an asset_id between two different draws
         # or two different underlying distributions.

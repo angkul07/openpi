@@ -35,15 +35,15 @@ support for reading the results honestly.
 | File | Change | Why |
 | --- | --- | --- |
 | `src/openpi/training/data_loader.py` (+379) | `MixtureDataset`, `StratifiedBatchSampler`, `make_stratified_batch_sampler`, `_NoVideoLeRobotDataset`, `select_holdout_episodes`, `_remap_episode_data_index` | The core of the fork. Concatenates N LeRobot datasets and draws a **fixed count per source per batch**, so `p_teleop` is set explicitly and never inherited from disk. Also seeks by `start_batch` for resume. |
-| `src/openpi/training/config.py` (+883) | `MixtureSource`, `LeRobotYamMixtureDataConfig`, `LeRobotYamDataConfig`, `TrainConfig.max_to_keep`, and 16 training arms | The config surface for the above, plus every experiment. **This is the file that has gotten unmanageable** — see [§6](#6-the-config-problem). |
+| `src/openpi/training/config.py` (+883) | `MixtureSource`, `LeRobotRobotDataConfig` / `LeRobotRobotMixtureDataConfig`, `TrainConfig.max_to_keep`, and 14 training arms | The config surface for the above, plus every experiment. **This is the file that has gotten unmanageable** — see [§6](#6-the-config-problem). |
 | `src/openpi/training/augment.py` (+132, new) | `ImageAugmentConfig` / `ImageAugment`, wired through `DataConfig.train_only_transforms` | Data-side augmentation that is off at eval by construction. |
 | `src/openpi/models/pi0_config.py` (+10) | `image_augmentation: bool = True` | Opt-out for openpi's **built-in, separate** model-side augmentation. Defaults `True` so no existing config changes behaviour. |
 | `src/openpi/models/pi0.py` (+9) | `preprocess_observation(train=train and self.image_augmentation)` | Implements that opt-out. `train` gates nothing else in `compute_loss`, so this disables augmentation and nothing more. |
 | `scripts/train.py` (+78) | Flow-loss reporting (`flow_loss`, `flow_loss_chunk_first`, `flow_loss_chunk_last`); per-step `train_metrics.log`; resume seeks the data stream to `latest_step + 1` | `loss` means cross-entropy on FAST arms and flow MSE on pi0.5 arms — logging both under one name made the two families unreadable side by side. `chunk_last` is the metric that actually moves. |
 | `scripts/compute_norm_stats.py` (+52) | `--skip-videos`; mixture stats computed **through the training sampler**; output keyed on `asset_id` not `repo_id` | Raw-storage stats would be ego-dominated (33/67) and would misnormalise exactly the teleop grippers the experiments prioritise. `--skip-videos` turns hours into minutes — the script only reads `state`/`actions`. |
 | `src/openpi/training/checkpoints.py` (+11) | `max_to_keep` plumbed through (was hardcoded `1`) | A rolling window of recent checkpoints, so a run can be scored at several points without keeping 50 × 10 GB. |
-| `src/openpi/policies/yam_policy.py` (+78, new) | `YamInputs` / `YamOutputs` for the 14-DoF bimanual YAM | Slices `[..., :14]`, which is what makes `action_dim=32` safe on pi0.5. |
-| `src/openpi/training/teleop_holdout.json` (+261, new) | 249 held-out `abc-teleop` episode indices | The offline eval set. Nothing moves on disk — these are simply never sampled. |
+| `src/openpi/policies/robot_policy.py` (new) | `RobotSpec` + `RobotInputs` / `RobotOutputs`, parameterised by embodiment | Replaced the per-robot `yam_policy.py` / `piper_policy.py` pair, which were ~95% identical. Slices to the spec's action width, which is what makes `action_dim=32` safe on pi0.5. |
+| `configs/fd/teleop_holdout.json` (+261, new) | 249 held-out `abc-teleop` episode indices | The offline eval set. Nothing moves on disk — these are simply never sampled. |
 
 ### Invariants these introduced
 
@@ -84,8 +84,8 @@ imported by openpi itself.
 
 ## 4. Training configs
 
-All live in `src/openpi/training/config.py`. Batch 64, `gemma_2b_lora`, cosine
-3.5e-5 → 3.5e-6, EMA off throughout unless noted.
+All live in `configs/fd/yam/` (see [§6](#6-the-config-problem)). Batch 64,
+`gemma_2b_lora`, cosine 3.5e-5 → 3.5e-6, EMA off throughout unless noted.
 
 ### pi0-FAST arms
 
@@ -118,7 +118,7 @@ All live in `src/openpi/training/config.py`. Batch 64, `gemma_2b_lora`, cosine
 | `pi05_abcego_sd` | `abc-ego` screwdriver, 730,496 frames | 64/0 | 11,414 | 100% teleop, single task, **exactly one epoch**, no augmentation. |
 | `pi05_50run_ea` | `angkul07/50_run_v21_fixed`, 50/50 pre-merged | 64 | 17,700 | The openpi counterpart of the LeRobot 50/50 run. Same data, schedule and trainable set, so the two are directly comparable. |
 
-#### "Mixture of one" — why single-source configs still use `LeRobotYamMixtureDataConfig`
+#### "Mixture of one" — why single-source configs still use `LeRobotRobotMixtureDataConfig`
 
 `pi05_abcego_sd` and `pi05_50run_ea` have one source each and still go through the
 mixture path, deliberately, for two mechanical reasons:
@@ -207,6 +207,17 @@ client slug, and registration raises on any collision.
   `configs/fd/piper/`.
 - `run_yam.sh` derives its checkpoint subdirectory by stripping known family prefixes,
   so a new client's arms need the experiment name passed explicitly as `$2`.
-- `LeRobotYamDataConfig` still hardcodes YAM's camera keys and the
-  `make_bool_mask(6, -1, 6, -1)` delta mask. Making the data config robot-parameterised
-  is the next thing standing between this and a genuinely client-generic pipeline.
+- `LeRobotYamDataConfig` was robot-parameterised — see the row above. What remains
+  embodiment-specific and is *not* yet in `RobotSpec`: the assumption of an arm-major
+  `[joints..., gripper]` state layout (a dataset with different **per-arm** structure
+  still needs its own mask; a right-arm-first layout is fine, since the mask is
+  symmetric across arms), and control frequency, which nothing in the config models —
+  the 20 Hz Piper data and the 30 Hz YAM data are indistinguishable to openpi.
+
+  Image resolution is **not** on this list. `IMAGE_RESOLUTION = (224, 224)` is
+  openpi's own model-level constant (`models/model.py`), and `preprocess_observation`
+  resizes anything that does not match it for every config, upstream's included. It is
+  fixed by the pretrained SigLIP input size, so it is a property of the model, not the
+  robot, and does not belong in a robot spec. The only nit is cosmetic:
+  `ModelTransformFactory` writes the literal `224, 224` three times instead of
+  referencing the constant.

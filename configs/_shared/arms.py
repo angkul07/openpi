@@ -35,6 +35,7 @@ import openpi.models.gemma as _gemma
 import openpi.models.gemma_fast as _gemma_fast
 import openpi.models.pi0_config as pi0_config
 import openpi.models.pi0_fast as pi0_fast
+from openpi.policies.robot_policy import RobotSpec
 import openpi.training.augment as _augment
 import openpi.training.config as _config
 import openpi.training.weight_loaders as weight_loaders
@@ -67,6 +68,7 @@ def _validate_mixture(name: str, sources: Sequence[_config.MixtureSource], batch
 def pi05_arm(
     name: str,
     *,
+    robot: RobotSpec,
     sources: Sequence[_config.MixtureSource],
     asset_id: str,
     schedule: Schedule,
@@ -93,7 +95,7 @@ def pi05_arm(
         `action_in_proj` as Linear(32, 1024); `weight_loaders._merge_params()` matches
         on key NAMES only and never compares shapes, so 14 does not raise at load --
         it dies later inside jit, pointing nowhere near the cause. Nothing downstream
-        cares: `YamOutputs` slices [..., :14] and `PadStatesAndActions` zero-pads.
+        cares: `RobotOutputs` slices to the spec's action_dim and `PadStatesAndActions` zero-pads.
 
       max_token_len=200 because pi0.5 has no FAST action tokens -- actions reach the
         flow expert as continuous conditioning and never enter the token stream. The
@@ -124,7 +126,8 @@ def pi05_arm(
     return _config.TrainConfig(
         name=name,
         model=model,
-        data=_config.LeRobotYamMixtureDataConfig(
+        data=_config.LeRobotRobotMixtureDataConfig(
+            robot=robot,
             # The "primary" source; norm stats live under assets/<config>/<asset_id>.
             repo_id=repo_id or sources[0].repo_id,
             assets=_config.AssetsConfig(asset_id=asset_id),
@@ -151,6 +154,7 @@ def pi05_arm(
 def pi0_fast_arm(
     name: str,
     *,
+    robot: RobotSpec,
     sources: Sequence[_config.MixtureSource],
     asset_id: str,
     schedule: Schedule,
@@ -192,7 +196,8 @@ def pi0_fast_arm(
     return _config.TrainConfig(
         name=name,
         model=model,
-        data=_config.LeRobotYamMixtureDataConfig(
+        data=_config.LeRobotRobotMixtureDataConfig(
+            robot=robot,
             repo_id=repo_id or sources[0].repo_id,
             assets=_config.AssetsConfig(asset_id=asset_id),
             base_config=_config.DataConfig(prompt_from_task=True),
