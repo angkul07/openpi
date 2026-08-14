@@ -123,7 +123,7 @@ def main() -> None:
     print(f"train   : {len(lengths) - len(holdout):>4} episodes  {kept_frames:>9,} frames  {hrs(kept_frames):6.3f} h")
     print(f"result  : teleop is {ratio:.2%} of training storage (target {args.target_frac:.0%})")
     print()
-    print("paste into config.py as _TELEOP_HOLDOUT_EPISODES:")
+    print("write into configs/fd/teleop_holdout.json as {\"episodes\": [...]}:")
     print("(" + ", ".join(str(e) for e in holdout) + ")")
 
     if args.dry_run:

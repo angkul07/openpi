@@ -13,6 +13,7 @@ import openpi.models.model as _model
 import openpi.shared.normalize as normalize
 import openpi.training.config as _config
 import openpi.training.data_loader as _data_loader
+import openpi.training.fingerprint as _fingerprint
 import openpi.transforms as transforms
 
 
@@ -150,9 +151,22 @@ def main(config_name: str, max_frames: int | None = None, skip_videos: bool = Fa
 
     # asset_id, not repo_id: a mixture has several repo ids, and different mixture
     # ratios need their own stats even when the source datasets are identical.
-    output_path = config.assets_dirs / (data_config.asset_id or data_config.repo_id)
+    asset_id = data_config.asset_id or data_config.repo_id
+    output_path = config.assets_dirs / asset_id
     print(f"Writing stats to: {output_path}")
     normalize.save(output_path, norm_stats)
+
+    # Record WHICH distribution these describe, right next to them. Stats are computed
+    # through the training sampler, so a copied directory or a reused asset_id would
+    # otherwise normalise training against the wrong distribution with nothing to
+    # notice it -- and run_yam.sh skips this stage whenever the file already exists.
+    # `_load_norm_stats` checks this on the way back in.
+    _fingerprint.write(
+        output_path,
+        _fingerprint.from_data_config_factory(config.data),
+        config_name=config.name,
+        asset_id=asset_id,
+    )
 
 
 if __name__ == "__main__":

@@ -156,24 +156,57 @@ verbatim on every revisit, so it blunts visual memorisation, not action memorisa
 
 ---
 
-## 6. The config problem
+## 6. The config problem, and the system that fixes it
 
-Sixteen experiment arms now live inside `src/openpi/training/config.py`, an upstream
-file, as ~900 lines of `TrainConfig` literals and comment blocks. This is why it
-hurts:
+Fourteen experiment arms (17 counting the unmerged Piper branch) had accumulated
+inside `src/openpi/training/config.py`, an upstream file, as ~900 lines of
+`TrainConfig` literals and comment blocks. Why it hurt:
 
-- **Merge surface.** Every branch edits the same list in the same file, so every
-  rebase onto upstream touches it.
-- **No isolation.** A Piper experiment and a YAM experiment are neighbours in one
-  list. Nothing scopes them apart.
-- **The knowledge is in comments.** The reasoning that makes these arms correct —
-  epoch math, why `action_dim=32`, which stats may be copied — is comment text next
-  to the literal. It cannot be tested, imported, or reused, and it is invisible to
-  anyone reading `git log`.
+- **Merge surface.** Every branch edited the same list in the same file, so every
+  rebase onto upstream touched it.
+- **No isolation.** A Piper experiment and a YAM experiment were neighbours in one
+  list. Nothing scoped them apart.
+- **The knowledge was in comments.** The reasoning that makes these arms correct —
+  epoch math, why `action_dim=32`, which stats may be copied — sat as comment text
+  next to the literal: untestable, unimportable, invisible to `git log`.
 - **Cross-arm coupling by convention only.** "`decay_steps` must equal
-  `num_train_steps`", "recompute steps if you change `batch_size`" are enforced by a
-  bash assert in `run_yam.sh`, not by the config layer.
+  `num_train_steps`" was enforced by a bash assert in `run_yam.sh`, not by the config
+  layer.
 
-The proposed fix is a per-client config tree (`configs/<client>/<experiment>/`) that
-registers into openpi rather than editing it. **Not implemented yet** — see the
-discussion attached to this change.
+### What was built
+
+A per-client config tree that **registers into** openpi instead of editing it. Full
+documentation is in [`configs/README.md`](configs/README.md).
+
+| Piece | What it does |
+| --- | --- |
+| `src/openpi/training/registry.py` | Walks `configs/`, imports every module, each registering its arms. Discovery is lazy (client modules import `config.py`, so import-time discovery would be a cycle). A module that fails to import is a **hard error** — a config that quietly vanishes from the CLI is how you launch the wrong arm. |
+| `src/openpi/training/fingerprint.py` | Writes `norm_stats_fingerprint.json` beside `norm_stats.json` recording the sources, roots, draws and holdout the stats were computed through; `_load_norm_stats` checks it and **raises** on mismatch. Legacy stats with no fingerprint warn instead, so existing boxes keep working. |
+| `configs/_shared/schedule.py` | `Schedule` derives `decay_steps` from `num_train_steps` — they cannot disagree — and computes step counts from epoch targets instead of hand-written tables. |
+| `configs/_shared/arms.py` | `pi05_arm()` / `pi0_fast_arm()`. One `Pi0Config` feeds both `model` and `freeze_filter` (they used to be two hand-copied instances); one `augment=` flag moves both augmentation stacks; refuses draws that don't sum to `batch_size` and mixtures with no `asset_id`. |
+| `configs/fd/` | Our own R&D arms — `datasets.py` (roots, frame counts, holdout), `yam/*.py` (one module per experiment, reasoning in the docstring). |
+| `configs/_template/` | Skeleton to copy for a new client. |
+| `scripts/dump_configs.py` | Canonical, address-scrubbed dump of every config including what `data.create()` produces. Dump before, dump after, diff. |
+
+`config.py` shrank from 1,872 to 1,127 lines and now contains only upstream openpi's
+own recipes plus the mixture machinery.
+
+### What did not change
+
+Config names, checkpoint paths, W&B history and `assets/<config>/` directories are all
+untouched, so existing runs and stats stay valid. `scripts/dump_configs.py` proved the
+migration byte-identical across **all 45 configs** — including each arm's fully
+created `DataConfig` (transforms, mixture, delta masks). The `fd/` arms keep their
+historical unprefixed names for that reason; new client arms must be prefixed with the
+client slug, and registration raises on any collision.
+
+### Still open
+
+- Piper's 3 arms migrate when `piper1h-pi05` lands; that branch will conflict on
+  `config.py` once, and the resolution is to delete its arms and re-add them under
+  `configs/fd/piper/`.
+- `run_yam.sh` derives its checkpoint subdirectory by stripping known family prefixes,
+  so a new client's arms need the experiment name passed explicitly as `$2`.
+- `LeRobotYamDataConfig` still hardcodes YAM's camera keys and the
+  `make_bool_mask(6, -1, 6, -1)` delta mask. Making the data config robot-parameterised
+  is the next thing standing between this and a genuinely client-generic pipeline.

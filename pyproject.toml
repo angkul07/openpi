@@ -73,6 +73,13 @@ dlimp = { git = "https://github.com/kvablack/dlimp", rev = "ad72ce3a9b414db2185b
 [tool.uv.workspace]
 members = ["packages/*"]
 
+[tool.pyright]
+# `configs/` is a repo-root package imported at runtime via sys.path (see
+# openpi.training.registry). Tell the type checker where to find it.
+extraPaths = ["."]
+venvPath = "."
+venv = ".venv"
+
 [tool.ruff]
 line-length = 120
 target-version = "py311"
