@@ -3,17 +3,37 @@
 Three pi0.5 arms, one task (*"pick up the cube and place it in the tray"*), one
 embodiment, one holdout. They differ in what is in the batch and in nothing else.
 
-    arm              total data     per-batch draw (of 64)    what it asks
-    ---------------  -------------  ------------------------  --------------------------
-    mm_pi05_sim10    ~9 min sim     sim 64                    the baseline
-    mm_pi05_mix10    ~5 + ~5 min    sim 32 / ego 32           REPLACE half the sim with
-                                                              ego at a fixed data budget
-    mm_pi05_mix20    ~10 + ~10 min  sim 32 / ego 32           ADD ego on top, doubling
-                                                              the data at fixed compute
+    arm                 total data     per-batch draw (of 64)  what it asks
+    ------------------  -------------  ----------------------  -----------------------
+    mm_pi05_sim10       ~9 min sim     sim 64                  the baseline
+    mm_pi05_mix10       ~5 + ~5 min    sim 32 / ego 32         REPLACE half the sim with
+                                                               ego at a fixed budget
+    mm_pi05_mix20       ~10 + ~10 min  sim 32 / ego 32         ADD ego on top, doubling
+                                                               the data at fixed compute
+    mm_pi05_gapmix10    ~5 + ~5 min    sim 32 / gap-ego 32     mix10, but the ego half is
+                                                               capability-gap filtered
+    mm_pi05_gapmix20    ~10 + ~10 min  sim 32 / gap-ego 32     mix20, same filter
 
 `mm_pi05_sim10` vs `mm_pi05_mix10` is the clean A/B: same total minutes, same steps,
 same schedule, same holdout -- composition is the only moving part. `mm_pi05_mix20`
 then asks whether more data helps once the ratio is already balanced.
+
+THE GAP ARMS, AND WHAT THEY ISOLATE
+    `gapmix10`/`gapmix20` differ from `mix10`/`mix20` in exactly one thing: WHICH ego
+    frames are in the pool. Ego is filtered to the clips that fill a measured coverage
+    gap in the sim pool (`gap-poc-so101`, union of all six gaps: 236/324 clips), then
+    cut to a frame budget with the gap mix preserved. So:
+
+        gapmix vs mix     isolates the FILTER (same minutes, different ego frames)
+        gapmix vs sim10   isolates the ego CONTENT, as before
+
+    The pools are pre-built on disk rather than sampled with `holdout_fraction`, and
+    `ego_gap5` is a strict subset of `ego_gap10` -- so unlike the mix arms, moving from
+    5 to 10 minutes of ego here adds clips without swapping any. `configs/mm/datasets.py`
+    has the three reasons in full.
+
+    Do not read `gapmix20 > gapmix10` as "the filter scales". Every arm here is one
+    seed on a 5-episode holdout; treat sub-10% gaps as ties.
 
 WHAT "5 MINUTES OF SIM" ACTUALLY MEANS HERE
     The client has 9 min 15 s of sim, not 10, so "10 minutes" is the whole pool and
@@ -218,6 +238,34 @@ MIX20_SOURCES = (
 )
 
 
+def _ego_gap_source(samples_per_batch: int, *, repo_id: str, root: str) -> _config.MixtureSource:
+    """A pre-built, gap-stratified ego pool, consumed whole.
+
+    No `holdout_fraction`: the pool is already exactly the minutes this arm is meant to
+    have, and drawing a uniform random fraction on top would undo the stratification.
+    `configs/mm/datasets.py` has the full argument.
+    """
+    return _config.MixtureSource(
+        repo_id=repo_id,
+        samples_per_batch=samples_per_batch,
+        root=root,
+    )
+
+
+# --- 4 & 5. the same two mixtures, but ego filtered to the capability gaps ---
+# Identical to MIX10/MIX20 in every respect except WHICH ego frames are in the pool, so
+# gapmix-vs-mix isolates the filter and gapmix-vs-sim10 isolates the ego content.
+GAPMIX10_SOURCES = (
+    _sim_source(_MIX_DRAW, half=True),
+    _ego_gap_source(_MIX_DRAW, repo_id=ds.EGO_GAP5_REPO, root=ds.EGO_GAP5_ROOT),
+)
+
+GAPMIX20_SOURCES = (
+    _sim_source(_MIX_DRAW, half=False),
+    _ego_gap_source(_MIX_DRAW, repo_id=ds.EGO_GAP10_REPO, root=ds.EGO_GAP10_ROOT),
+)
+
+
 registry.register(
     pi05_arm(
         "mm_pi05_sim10",
@@ -269,6 +317,34 @@ registry.register(
         max_to_keep=1,
         keep_period=None,
     ),
+    # --- the gap-filtered pair. New NAMES, not edits to mix10/mix20: those two are
+    # published with results and their `assets/<config>/<asset_id>` norm stats and
+    # checkpoint dirs are keyed by name. Reusing the names would collide on both and
+    # make the report's numbers unattributable.
+    pi05_arm(
+        "mm_pi05_gapmix10",
+        robot=SO101,
+        sources=GAPMIX10_SOURCES,
+        asset_id="mm_gapmix10",
+        schedule=_SCHEDULE,
+        batch_size=BATCH_SIZE,
+        repo_id=ds.SIM_REPO,
+        save_interval=1_000,
+        max_to_keep=1,
+        keep_period=None,
+    ),
+    pi05_arm(
+        "mm_pi05_gapmix20",
+        robot=SO101,
+        sources=GAPMIX20_SOURCES,
+        asset_id="mm_gapmix20",
+        schedule=_SCHEDULE,
+        batch_size=BATCH_SIZE,
+        repo_id=ds.SIM_REPO,
+        save_interval=1_000,
+        max_to_keep=1,
+        keep_period=None,
+    ),
     # NOT an experimental arm. It exists so `pi05_base` can be loaded for eval as a
     # zero-shot control: `create_trained_policy` restores params by exact structural
     # match, and base ships no LoRA leaves, so a `gemma_2b_lora` trunk raises
@@ -308,6 +384,20 @@ def describe() -> str:
         (
             "mm_pi05_mix20",
             (("sim", ds.SIM_TRAIN_FRAMES, _MIX_DRAW), ("ego/10min", ds.EGO_HALF_TRAIN_FRAMES, _MIX_DRAW)),
+        ),
+        (
+            "mm_pi05_gapmix10",
+            (
+                ("sim/half", ds.SIM_HALF_TRAIN_FRAMES, _MIX_DRAW),
+                ("ego/gap5", ds.EGO_GAP5_TRAIN_FRAMES, _MIX_DRAW),
+            ),
+        ),
+        (
+            "mm_pi05_gapmix20",
+            (
+                ("sim", ds.SIM_TRAIN_FRAMES, _MIX_DRAW),
+                ("ego/gap10", ds.EGO_GAP10_TRAIN_FRAMES, _MIX_DRAW),
+            ),
         ),
     )
     return "\n".join(f"{name}\n{_SCHEDULE.describe(sources)}" for name, sources in arms)

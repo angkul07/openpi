@@ -90,7 +90,12 @@ SIM_REPO = "makermods/maniskill_50ep_so101_blue_cube_orange_tray_20260812_131142
 # Point this at the v2.1 CONVERSION, not at a plain `hf download` of the repo above.
 SIM_ROOT = os.environ.get("MM_SIM_ROOT", "/workspace/mm/sim_v21")
 
-TASK = "pick up the cube and place it in the tray"  # the only task string in either pool
+# The sim pool's ONLY task string, and the prompt every eval uses. NOT the only string in
+# play: ego carries 89 distinct ones (~11 clips each), and with `prompt_from_task=True`
+# half of every mixture batch is conditioned on a sentence the eval never asks for. That
+# was measured and left alone deliberately -- it makes the mixture arms answer "does
+# DIVERSE pick-place ego data help", not "does more of this one task help".
+TASK = "pick up the cube and place it in the tray"
 
 
 def _splits() -> dict:
@@ -136,11 +141,11 @@ SIM_HALF_TRAIN_FRAMES = _SPLITS["half_train_frames"]  # 7,756 -- 4.31 min, 51.75
 EGO_REPO = "makermods/egodex-so101-pickplace"
 EGO_ROOT = os.environ.get("MM_EGO_ROOT", "/workspace/mm/ego_v21")
 
-# ESTIMATED: 324 clips x 20 min 15 s at 30 Hz. Replace with the measured
-# `total_frames` once the dataset is built. Nothing derives from it -- the schedule
-# comes off the sim pool -- so it only affects the epoch table the module prints.
+# MEASURED off the built dataset's `meta/info.json` (was estimated at 36,400 before it
+# existed). Nothing load-bearing derives from it -- the schedule comes off the sim pool --
+# so it only moves the epoch table the module prints.
 EGO_TOTAL_EPISODES = 324
-EGO_TOTAL_FRAMES = 36_400  # ~20.2 min
+EGO_TOTAL_FRAMES = 36_442  # 20.2 min at 30 Hz, 89 task strings
 
 # The mixture arms want 10 min and 5 min of ego out of that ~20 min. Both are taken with
 # `MixtureSource.holdout_fraction`, which withholds a deterministic seeded sample of
@@ -161,3 +166,36 @@ EGO_HOLDOUT_SEED = 0
 
 EGO_HALF_TRAIN_FRAMES = round(EGO_TOTAL_FRAMES * (1 - EGO_HALF_HOLDOUT_FRACTION))  # ~18,200
 EGO_QUARTER_TRAIN_FRAMES = round(EGO_TOTAL_FRAMES * (1 - EGO_QUARTER_HOLDOUT_FRACTION))  # ~9,100
+
+
+# ---------------------------------------------------------------------------
+# Ego, capability-gap filtered -- pre-built pools, MEASURED not estimated
+# ---------------------------------------------------------------------------
+# `gap-poc-so101` labels all 374 clips (50 sim + 324 ego) on one VLM schema and reports
+# which ego clips fill each gap in the sim pool's coverage. Keeping the union of all six
+# gaps leaves 236/324 clips (27,279 frames, 15.2 min); these two pools are gap-stratified,
+# frame-budgeted subsets of that, built by `build_ego_subset.py`.
+#
+# THREE REASONS THESE ARE PRE-BUILT ROOTS RATHER THAN `holdout_fraction` DRAWS:
+#
+#   1. `select_holdout_episodes` is a uniform `rng.choice` over episodes, so it would
+#      erode exactly the gap stratification the filter exists to create -- and it would
+#      do it to `gapmix10`, the arm that is the clean A/B against `mm_pi05_sim10`.
+#   2. The fraction is of EPISODES, not frames. At 157 clips of uneven length that is a
+#      several-percent error on the thing being held fixed; a frame budget is exact.
+#   3. GAP5 IS A STRICT SUBSET OF GAP10 (verified). Two independent `holdout_fraction`
+#      draws are not nested -- see the note above -- so under the old mechanism the
+#      5-minute arm trained on clips the 10-minute arm had never seen, which confounds
+#      "how much ego" with "which ego". Here the only difference is quantity.
+#
+# Both pools are consumed WHOLE: the arms set no holdout_fraction. Nothing is held out on
+# the ego side because the headline metric is sim-task performance on sim frames.
+EGO_GAP10_REPO = "makermods/egodex-so101-pickplace-gap10"
+EGO_GAP10_ROOT = os.environ.get("MM_EGO_GAP10_ROOT", "/workspace/mm/ego_gap10_v21")
+EGO_GAP10_EPISODES = 157
+EGO_GAP10_TRAIN_FRAMES = 17_950  # 9.97 min at 30 Hz, 62 task strings
+
+EGO_GAP5_REPO = "makermods/egodex-so101-pickplace-gap5"
+EGO_GAP5_ROOT = os.environ.get("MM_EGO_GAP5_ROOT", "/workspace/mm/ego_gap5_v21")
+EGO_GAP5_EPISODES = 88
+EGO_GAP5_TRAIN_FRAMES = 8_976  # 4.99 min at 30 Hz, 47 task strings
