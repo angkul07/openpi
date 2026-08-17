@@ -39,42 +39,48 @@ WHY ALL THREE RUN THE SAME NUMBER OF STEPS
     loss to rank its arms at all. One `_SCHEDULE` object is shared by all three arms
     here so they cannot drift apart.
 
-WHAT 2,400 STEPS BUYS, AND THE EPOCH SPREAD IT LEAVES
-    Roughly 154k samples per arm. The epochs each pool gets fall out of that and differ
-    per arm by design, because the arms differ in pool size:
+WHY 5,000 STEPS, AND THE EPOCH SPREAD IT LEAVES
+    The first pass at this experiment ran 2,400 steps and was undertrained -- it said so
+    plainly: all three arms were still descending 7.7-8.7% across their final 200 steps
+    when the cosine ran out. That makes their ranking a statement about step 2,400 rather
+    than about the data, and it biases one arm in particular. `mix20` carries 3x the data
+    and 89 extra task strings, so it is the furthest from convergence at any step count
+    the three of them share; some unknown part of its 11.8% holdout penalty is a budget
+    artefact rather than a verdict on ego.
 
-        mm_pi05_sim10   sim 10.25
-        mm_pi05_mix10   sim/half 9.90   ego 8.44
-        mm_pi05_mix20   sim 5.12        ego 4.22
+    5,000 steps is ~320k samples per arm. The epochs each pool gets fall out of that and
+    differ per arm by design, because the arms differ in pool size:
 
-    Note `sim10` at 10.25 and `mix10`'s sim half at 9.90 are nearly equal -- half the
-    draw on half the data. So those two arms give the sim pool the same number of
-    passes, and the only difference is that half of `mix10`'s gradient comes from ego
-    instead of from more sim. That is what makes the pair a clean A/B rather than two
-    runs that happen to have the same length.
+        mm_pi05_sim10   sim 21.35
+        mm_pi05_mix10   sim/half 20.63   ego 17.58
+        mm_pi05_mix20   sim 10.68        ego 8.79
 
-    Against our own guidance -- 1-3 epochs of a scarce pool, memorisation risk past
-    ~5 -- `mix20` sits just at the edge and the other two are about 2x over it. That is
-    a real cost accepted knowingly, and it is not fixable by shortening the run: that
-    guidance was calibrated on 250k-1M-frame multi-task pools where one epoch is already
-    thousands of steps, whereas here one epoch of the ENTIRE dataset is 234 steps. The
-    two things the rule conflates -- steps (has the optimiser converged?) and epochs (am
-    I memorising?) -- come apart completely at nine minutes of data, and obeying the
-    epoch band literally would mean a ~1,200-step run that has barely left warmup.
+    `sim10` at 21.35 and `mix10`'s sim half at 20.63 stay nearly equal -- half the draw
+    on half the data -- so the pair is still the clean A/B it was at 2,400: the same
+    number of passes over sim, and the only difference is that half of `mix10`'s gradient
+    comes from ego instead of from more sim.
 
-    So the design moves the stopping decision downstream instead: save every 300 steps
-    and let the holdout choose the checkpoint. That is why 10% of a very small pool is
-    spent on `SIM_HOLDOUT_EPISODES`.
+    Against our own guidance -- 1-3 epochs of a scarce pool, memorisation risk past ~5 --
+    every arm is now well past it and `sim10` by ~7x. Accepted knowingly, for the same
+    reason as before: that guidance was calibrated on 250k-1M-frame multi-task pools
+    where one epoch is already thousands of steps, whereas here one epoch of the ENTIRE
+    dataset is 234 steps. The two things the rule conflates -- steps (has the optimiser
+    converged?) and epochs (am I memorising?) -- come apart completely at nine minutes of
+    data, and obeying the band literally would mean a ~1,200-step run that has barely
+    left warmup.
 
-    What to actually look at, in order: holdout MSE per checkpoint (if it stalls or
-    worsens while train loss keeps falling, ship the earlier checkpoint -- that is the
-    signal this design exists to catch); grad-norm trajectory (a DECLINING one is the
-    memorisation signature that flagged mix9010); and `chunk_last` rather than aggregate
-    loss, since delta actions make t=0 nearly free.
+    But the memorisation risk is now real in a way it was not at 10 epochs, and this run
+    keeps no checkpoint ladder to catch it (see the save policy on the arms). So watch
+    the HOLDOUT, not the train loss. `sim10` scored 82.10 deg^2 on `SIM_HOLDOUT_EPISODES`
+    at 2,400; if 5,000 does not beat that, the run overshot, and the fix is a shorter
+    re-run of ALL THREE rather than a shorter run of one -- they have to stay matched. A
+    DECLINING grad-norm trajectory is the same signature and is what flagged `mix9010`.
 
-    If the holdout says every arm peaked early, the fix is fewer steps and a re-run of
-    all three, never a shorter run of one -- they have to stay matched. The cosine is
-    spent at the end of a run, so a finished arm cannot usefully be extended either.
+    What to look at, in order: holdout MSE in degrees, which is the only cross-arm
+    comparable number (per-arm norm stats make training loss meaningless BETWEEN arms --
+    at 2,400 the raw loss ranked `mix10` first and the holdout ranked it second);
+    grad-norm trajectory; then `chunk_last` rather than aggregate loss, since delta
+    actions make t=0 nearly free.
 
 BEFORE LAUNCHING, DO THE NORM-STATS PREFLIGHT (30 minutes, saves 9 hours)
     Per-dim p1/p50/p99 of `observation.state` and `action`, for the sim pool and the ego
@@ -113,9 +119,28 @@ RUNNING THEM
         ./vast_run/run_yam.sh mm_pi05_mix10 mix10
         ./vast_run/run_yam.sh mm_pi05_mix20 mix20
 
-    `mm_pi05_sim10` is runnable as soon as the sim dataset is converted to v2.1; the two
-    mixture arms also need the retargeted ego dataset, which does not exist yet. Run the
-    baseline first -- it is the one the other two are measured against.
+    Run the baseline first -- it is the one the other two are measured against.
+
+EXTENDING THE 2,400-STEP RUN INSTEAD OF RESTARTING IT
+    `--resume` restores params AND optimizer state from the newest checkpoint, but the
+    optimizer is rebuilt from THIS config (`train.py:88`, before the resume branch), and
+    `Schedule.lr_schedule()` pins `decay_steps` to `num_train_steps`. So a resumed arm
+    does not continue its old curve -- it lands on the NEW 5,000-step cosine evaluated at
+    its restored step. Concretely, resuming at 2,399:
+
+        old 2,400-step schedule @ 2399   3.50e-06   <- where the arm finished
+        new 5,000-step schedule @ 2399   2.16e-05   <- where it resumes, a 6.2x jump UP
+
+    That is a warm restart, not a continuation. It is a legitimate thing to do and it
+    saves ~1 h/arm, but it is only safe if ALL THREE arms are resumed, because then all
+    three see the identical LR trajectory and stay matched. Resuming the baseline alone
+    while the mixture arms start fresh gives `sim10` a different optimisation history
+    from the two arms it is the reference for, and every comparison in the report is
+    against `sim10`. The saving is one GPU-hour. Do not buy it with the baseline.
+
+    Preflight if resuming: each checkpoint dir must still hold `train_state/` and not
+    only `params/`. The eval staging only ever needed `params`, so the HF copies should
+    be checked rather than assumed.
 """
 
 from configs._shared.arms import pi05_arm
@@ -137,13 +162,13 @@ _MIX_DRAW = BATCH_SIZE // 2
 # epoch target could describe all of them anyway. `describe()` reports the epochs each
 # arm actually gets.
 _SCHEDULE = Schedule.of_steps(
-    2_400,
-    # 10.4% of the run, which is high against the usual 2-5% -- kept anyway because the
-    # bound that matters here is ABSOLUTE, not fractional. The risky region is the first
-    # few hundred steps whatever the run length: freshly initialised LoRA B-matrices and
-    # projections produce their largest gradients there, and every FD run's peak grad
-    # norm has landed inside or just after warmup. Scaling this to 5% would put it at
-    # ~120, below the point where our own runs stopped spiking.
+    5_000,
+    # Held at 250 while the run more than doubled, so this is now 5.0% of it rather than
+    # 10.4% -- and that is the point. The bound that matters is ABSOLUTE, not fractional:
+    # the risky region is the first few hundred steps whatever the run length, because
+    # freshly initialised LoRA B-matrices and projections produce their largest gradients
+    # there, and every FD run's peak grad norm has landed inside or just after warmup.
+    # Holding it fixed drops the longer run into the usual 2-5% band for free.
     warmup_steps=250,
 )
 
@@ -201,15 +226,21 @@ registry.register(
         asset_id="mm_sim10",
         schedule=_SCHEDULE,
         batch_size=BATCH_SIZE,
-        # 8 checkpoints written, 6 kept: the rolling window holds 1500-2400 and
-        # `keep_period` pins 600 and 1200 on top of it, so the curve is sampled across
-        # the WHOLE run and not just its tail. That matters because the whole design
-        # leans on picking a checkpoint by holdout score rather than taking the last
-        # one, and at ~10 epochs the knee can easily land in the first half. Six pi0.5
-        # checkpoints is the disk cost of being able to see it.
-        save_interval=300,
-        max_to_keep=4,
-        keep_period=600,
+        # LAST CHECKPOINT ONLY. A pi0.5 checkpoint here is 13 GB (6.7 params + 5.9
+        # optimizer state), so the original 300/4/600 policy kept SIX per arm = 78 GB and
+        # three arms did not fit a 150 GB box. `train.py` always writes the final step on
+        # top of the interval, so `save_interval` is really just crash-resume granularity
+        # -- ~23 min of work at risk here -- and the run still ends at 4999. Retention is
+        # a disk policy and never touches the optimizer, so arms stay matched whatever
+        # any of them was previously run under.
+        #
+        # The cost, stated plainly: this run cannot pick a checkpoint by holdout score.
+        # If 5,000 overshoots the knee the way 2,400 undershot it, that is only visible
+        # by re-running shorter. `keep_period=2_500` pins one mid-run checkpoint for
+        # +13 GB/arm and buys that back.
+        save_interval=1_000,
+        max_to_keep=1,
+        keep_period=None,
     ),
     pi05_arm(
         "mm_pi05_mix10",
@@ -222,9 +253,9 @@ registry.register(
         # is looked up. Pinned to sim on both mixture arms so all three arms agree, and
         # so it does not silently follow `sources[0]`.
         repo_id=ds.SIM_REPO,
-        save_interval=300,
-        max_to_keep=4,
-        keep_period=600,
+        save_interval=1_000,
+        max_to_keep=1,
+        keep_period=None,
     ),
     pi05_arm(
         "mm_pi05_mix20",
@@ -234,9 +265,29 @@ registry.register(
         schedule=_SCHEDULE,
         batch_size=BATCH_SIZE,
         repo_id=ds.SIM_REPO,
-        save_interval=300,
-        max_to_keep=4,
-        keep_period=600,
+        save_interval=1_000,
+        max_to_keep=1,
+        keep_period=None,
+    ),
+    # NOT an experimental arm. It exists so `pi05_base` can be loaded for eval as a
+    # zero-shot control: `create_trained_policy` restores params by exact structural
+    # match, and base ships no LoRA leaves, so a `gemma_2b_lora` trunk raises
+    # "expected <class 'dict'> with 6 children, got 2" at `llm.layers.mlp`. At init LoRA
+    # is a functional no-op (B=0) but the param TREE still differs, which is what the
+    # restore compares. Identical to `mm_pi05_sim10` apart from the trunk variant; stage
+    # a checkpoint dir of base `params` plus a copy of an arm's `assets/<asset_id>`,
+    # since base has no norm stats of its own.
+    pi05_arm(
+        "mm_pi05_base_control",
+        robot=SO101,
+        sources=SIM10_SOURCES,
+        asset_id="mm_sim10",
+        schedule=_SCHEDULE,
+        batch_size=BATCH_SIZE,
+        paligemma_variant="gemma_2b",
+        save_interval=1_000,
+        max_to_keep=1,
+        keep_period=None,
     ),
 )
 
