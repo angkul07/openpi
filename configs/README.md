@@ -15,7 +15,7 @@ configs/
   _shared/          helpers, not arms. Leading underscore = never scanned.
     arms.py         pi05_arm() / pi0_fast_arm() builders + their validation
     schedule.py     Schedule: step counts and LR schedules, computed not commented
-    robots.py       RobotSpec per embodiment (YAM, PIPER_H, SO101)
+    robots.py       RobotSpec per embodiment (YAM, PIPER_H, PIPER_SINGLE, SO101)
   _template/        skeleton to copy for a new client
   fd/               one directory per client (fd = our own internal R&D)
     datasets.py     that client's roots, repo ids, frame counts, holdout indices
@@ -28,6 +28,10 @@ configs/
     make_sim_splits.py   regenerates it
     so101/
       sim_vs_ego.py
+  mf/               another client, on the single-arm Piper
+    datasets.py
+    piper/
+      ego_vs_teleop.py
 ```
 
 Anything whose path contains a component starting with `_` is skipped by the scanner
@@ -187,6 +191,28 @@ than an error, so existing boxes keep working. Recompute to silence it.
 Copying stats between arms is still legitimate when the mixture is genuinely identical
 — the `pi05_yam7h_*` arms reuse their `pi0_fast_yam7h_*` twins' stats, and the
 fingerprint matches because the distribution really is the same.
+
+## Stopping early
+
+`TrainConfig.early_stop` (see `openpi.training.early_stop`) ends a run once a logged
+metric stops improving. It is **off by default**, and every arm written before it runs
+its full `num_train_steps`, unchanged.
+
+Two things to understand before turning it on:
+
+- **A cosine schedule rarely plateaus.** `Schedule` pins `decay_steps` to
+  `num_train_steps`, so the LR is still falling at the last step and drags the training
+  loss down with it. This is a stall/divergence guard and a way to stop paying for a
+  dead run — not a convergence detector.
+- **What it stops on was never annealed.** Stopping at step k of N leaves the model at
+  step k's LR, which is not the model a k-step run would have produced. Keep
+  `keep_period` set and choose what to ship by holdout score, not by which step happened
+  to be last.
+
+It also changes what a config MEANS, from "train for N steps" to "train for at most N".
+Two arms of one experiment that stop in different places are no longer matched on
+exposure *or* on schedule position — the double confound that left the four-arm pi0.5
+mixture study unable to rank its own arms by loss. For a comparison, turn it off on both.
 
 ## Verifying a change
 

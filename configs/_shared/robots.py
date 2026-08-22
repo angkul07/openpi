@@ -131,3 +131,64 @@ SO101 = RobotSpec(
     gripper_per_arm=True,
     control_hz=30.0,
 )
+
+
+# ---------------------------------------------------------------------------
+# Piper (single arm) -- 6-DoF + gripper, 2 real cameras
+# ---------------------------------------------------------------------------
+# NOT `PIPER_H` above. That spec is the BIMANUAL 14-D rig with the `front`/`right`/`top`
+# camera set. This one is the single-arm `agilex_piper` build under `/workspace/final/`,
+# where the dead left half was dropped at conversion time rather than parked:
+#
+#     float32[7] = [j1..j6 DEGREES, gripper in {0, 1}]
+#
+# Dropping the parked half is what moves the gripper to index 6 in every pool at once.
+# Before that, retargeted data carried it at 6 and mrfood teleop at 12 under one
+# identical `float32[14]` dtype -- a mismatch nothing in the loader can see. Keep the
+# two specs separate: a 14-D dataset read through this spec silently trains on the
+# first 7 columns.
+#
+#     action_dim = 1 * (6 + 1)           = 7
+#     delta mask = make_bool_mask(6, -1) = (T,T,T,T,T,T,F)
+#
+# The gripper stays ABSOLUTE, which is what makes the binarisation usable: a {0,1}
+# channel differenced against the previous state would be {-1,0,+1} and the two edges
+# would be two rare classes instead of one level the model holds.
+#
+# JOINTS ARE IN DEGREES, not radians. Nothing here converts them and nothing needs to --
+# quantile norm is scale-free and every pool agrees. It matters when comparing to any
+# YAM or Piper H checkpoint, whose action space is radians: the numbers are 57.3x apart
+# and an eval that mixes the two reports nonsense.
+#
+# CAMERAS. `top` is the workspace view and `right-arm` is the wrist view, and unlike the
+# Piper H rig these names were checked against content. Note the HYPHEN in `right-arm`;
+# mrfood3 originally spelled it `r-arm` and was normalised on conversion, so a pool that
+# missed that normalisation fails loudly in the repack rather than training blind.
+#
+# The wrist view goes in SLOT 1 with slot 2 as padding, per the leading-slots rule at
+# the top of this file -- the DROID/libero two-camera occupancy pattern.
+#
+# WHAT THE TWO VIEWS ARE IS NOT THE SAME ON BOTH HALVES OF THE MIXTURE, and no spec can
+# fix it: mrfood's pair are two PHYSICAL cameras with real parallax, while the
+# retargeted pair are two crops of ONE egocentric frame and carry none. See
+# `configs/mf/datasets.py`.
+PIPER_SINGLE = RobotSpec(
+    name="piper_single",
+    cameras=(
+        "observation.images.top",  # -> base_0_rgb
+        "observation.images.right-arm",  # -> left_wrist_0_rgb
+        None,  # padding slot
+    ),
+    arms=1,
+    joints_per_arm=6,
+    gripper_per_arm=True,
+    # 20 Hz on all four pools, and for two different reasons. mrfood was RECORDED at 20;
+    # the retargeted pools were resampled 30 -> 20 onto a uniform 50 ms grid (nearest-
+    # frame decimation would have left alternating 33/67 ms gaps and a sawtooth velocity).
+    # Cross-checked against the frame counts: ego 109,730 / 1 h 31 m, stera 20,385 / 17 m,
+    # mrfood1 61,709 / 51 m, mrfood3 68,271 / 57 m all land on 20.0.
+    #
+    # A 50-step chunk is 2.5 s of future here -- same as PIPER_H, and NOT comparable to
+    # the 1.67 s that the same `action_horizon` buys on YAM or SO-101.
+    control_hz=20.0,
+)
