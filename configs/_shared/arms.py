@@ -79,6 +79,7 @@ def pi05_arm(
     max_to_keep: int = 4,
     keep_period: int | None = None,
     augment: bool = True,
+    early_stop: _config.EarlyStop | None = None,
     action_dim: int = 32,
     action_horizon: int = 50,
     max_token_len: int = 200,
@@ -105,6 +106,13 @@ def pi05_arm(
         defaults it to `pi05`, i.e. True. Do NOT copy `discrete_state_input=False`
         from `pi05_libero`: with pi05=True the state token is already absent from the
         suffix, so False means the model gets NO proprioception at all.
+
+      `early_stop` is OFF by default and every existing arm therefore runs its full
+        `num_train_steps`, unchanged. It is not a free upgrade: it changes what a
+        config MEANS from "train for N steps" to "train for at most N steps", so two
+        arms of one experiment are no longer matched on exposure unless both stop at
+        the same place. Do not turn it on for one arm of a comparison. See
+        `_config.EarlyStop`.
 
       num_workers=16 is measured, not guessed. A 200-step A/B on 2x A100-80GB gave
         16 -> 3.528 s/step at 95.0% GPU util against 32 -> 3.545 s/step at 94.7%:
@@ -148,6 +156,7 @@ def pi05_arm(
         keep_period=keep_period,
         freeze_filter=model.get_freeze_filter(),
         ema_decay=ema_decay,
+        early_stop=early_stop,
     )
 
 

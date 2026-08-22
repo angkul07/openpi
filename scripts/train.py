@@ -22,6 +22,7 @@ import openpi.shared.nnx_utils as nnx_utils
 import openpi.training.checkpoints as _checkpoints
 import openpi.training.config as _config
 import openpi.training.data_loader as _data_loader
+import openpi.training.early_stop as _early_stop
 import openpi.training.optimizer as _optimizer
 import openpi.training.sharding as sharding
 import openpi.training.utils as training_utils
@@ -316,8 +317,17 @@ def main(config: _config.TrainConfig):
     metrics_file.write(f"# {config.name}/{config.exp_name} start_step={start_step} steps={config.num_train_steps}\n")
     logging.info(f"Per-step metrics log: {metrics_path}")
 
+    early_stop = _early_stop.EarlyStopTracker(config.early_stop, start_step=start_step) if config.early_stop else None
+    if early_stop is not None:
+        logging.info(f"Early stopping enabled: {config.early_stop}")
+
     infos = []
+    # The step the loop actually finished on, which is `num_train_steps - 1` only when no
+    # early stop fires. The tail metric write and the final checkpoint both key off it.
+    last_step = start_step
+    stop_reason: str | None = None
     for step in pbar:
+        last_step = step
         with sharding.set_mesh(mesh):
             train_state, info = ptrain_step(train_rng, train_state, batch)
         infos.append(info)
@@ -329,16 +339,49 @@ def main(config: _config.TrainConfig):
             wandb.log(reduced_info, step=step)
             _write_per_step_metrics(metrics_file, stacked_infos, last_step=step, count=len(infos))
             infos = []
+            if early_stop is not None:
+                stop_reason = early_stop.should_stop(reduced_info, step)
         batch = next(data_iter)
 
-        if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:
+        # Always checkpoint the step an early stop lands on, whatever the interval says:
+        # it is the last state this run will ever have, and losing it would mean
+        # re-running to reach it.
+        if (
+            (step % config.save_interval == 0 and step > start_step)
+            or step == config.num_train_steps - 1
+            or stop_reason is not None
+        ):
             _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step)
+
+        if stop_reason is not None:
+            break
+
+    if stop_reason is not None:
+        best_value, best_step = early_stop.best
+        # `decay_lr` is a CosineDecaySchedule field, not part of the LRScheduleConfig
+        # protocol, so read it defensively -- an error path that itself raises is worse
+        # than a slightly vaguer message.
+        floor = getattr(config.lr_schedule, "decay_lr", None)
+        annealed_to = f"{floor:g}" if floor is not None else "its floor"
+        message = (
+            f"Early stop at step {last_step} of {config.num_train_steps}: {stop_reason}. "
+            f"NOTE this checkpoint was NOT annealed -- the schedule was set to reach "
+            f"{annealed_to} at step {config.num_train_steps}, so it stops mid-decay. Pick "
+            f"what to ship by holdout score over the kept checkpoints, not by this step "
+            f"being the last one."
+        )
+        pbar.write(message)
+        logging.info(message)
+        metrics_file.write(
+            f"# early_stop step={last_step} metric={config.early_stop.metric} best={best_value:.6f}@{best_step}\n"
+        )
+        wandb.log({"early_stop_step": last_step, "early_stop_best": best_value}, step=last_step)
 
     if infos:  # steps since the last log point would otherwise never be written
         _write_per_step_metrics(
             metrics_file,
             jax.device_get(common_utils.stack_forest(infos)),
-            last_step=config.num_train_steps - 1,
+            last_step=last_step,
             count=len(infos),
         )
     metrics_file.close()

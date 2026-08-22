@@ -26,6 +26,7 @@ import openpi.shared.normalize as _normalize
 from openpi.training import registry
 import openpi.training.augment as _augment
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
+from openpi.training.early_stop import EarlyStop
 import openpi.training.fingerprint as _fingerprint
 import openpi.training.misc.polaris_config as polaris_config
 import openpi.training.misc.roboarena_config as roboarena_config
@@ -669,6 +670,11 @@ class TrainConfig:
     num_workers: int = 2
     # Number of train steps (batches) to run.
     num_train_steps: int = 30_000
+    # If set, stop before `num_train_steps` once the watched metric stops improving.
+    # None (the default) keeps openpi's fixed-length behaviour exactly. See `EarlyStop`
+    # for why a cosine schedule makes this fire less often than you would expect, and
+    # why whatever it stops on is not the checkpoint you should ship.
+    early_stop: EarlyStop | None = None
 
     # How often (in steps) to log training metrics.
     log_interval: int = 100
