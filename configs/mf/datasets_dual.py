@@ -85,10 +85,10 @@ TELEOP_ROOT = _pool("teleop_v21")
 TELEOP_EPISODES = 86
 TELEOP_FRAMES = 138_120  # 1 h 55.1 m at 20 Hz; ~1,606 frames (~80 s) per episode
 
-# The single teleop task string, and the prompt every eval should use.
-# TBD: read the actual string from `<TELEOP_ROOT>/meta/tasks.jsonl` on the box -- the
-# alignment table records the COUNT (1) but not the text.
-TASK = "TBD"
+# The single teleop task string, and the prompt every eval should use. From the
+# final_data README (confirmed against the build): bimanual handover -- right arm
+# picks, hands over, left arm places.
+TASK = "right_pick_handover_left_place"
 
 
 # ---------------------------------------------------------------------------
