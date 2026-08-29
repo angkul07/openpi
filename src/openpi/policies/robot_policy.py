@@ -76,6 +76,18 @@ class RobotSpec:
     joints_per_arm: int = 6
     gripper_per_arm: bool = True
 
+    # Column ORDER of the state/action vectors. False -- the default, and every rig
+    # before the dual-arm Piper -- is ARM-MAJOR: [arm0 joints, arm0 gripper,
+    # arm1 joints, arm1 gripper]. True is JOINTS-MAJOR with the grippers trailing:
+    # [arm0 joints, arm1 joints, ..., arm0 gripper, arm1 gripper].
+    #
+    # Only `delta_action_mask()` depends on this -- norm stats are per-dim and
+    # learned from data, and the model has no idea what a dim means. But the mask
+    # dependence is load-bearing: reading a trailing-gripper dataset through an
+    # arm-major spec differences the second arm's gripper as if it were a joint and
+    # holds one of that arm's JOINTS absolute, and nothing raises.
+    grippers_trailing: bool = False
+
     # LeRobot feature names.
     state_feature: str = "observation.state"
     action_feature: str = "action"
@@ -151,14 +163,16 @@ class RobotSpec:
         """True where an action dim is converted to a delta relative to current state.
 
         Arm joints become deltas; grippers stay absolute. For the usual bimanual
-        6-DoF-plus-gripper robot this is `make_bool_mask(6, -1, 6, -1)`.
+        6-DoF-plus-gripper robot this is `make_bool_mask(6, -1, 6, -1)`; with
+        `grippers_trailing` it is `make_bool_mask(12, -2)`.
 
-        ASSUMES the state/action layout is arm-major:
-            [arm0 joints..., arm0 gripper, arm1 joints..., arm1 gripper]
-        A dataset ordered differently needs a different mask. Note the mask is
-        symmetric across arms, so a right-arm-first layout is still correct; only a
-        layout with different PER-ARM structure would break.
+        ASSUMES the layout the spec declares (see `grippers_trailing`). Either way
+        the mask is symmetric across arms, so a right-arm-first layout is still
+        correct; only a layout with different PER-ARM structure would break.
         """
+        if self.grippers_trailing:
+            grippers = -self.arms if self.gripper_per_arm else 0
+            return _transforms.make_bool_mask(self.arms * self.joints_per_arm, grippers)
         dims: list[int] = []
         for _ in range(self.arms):
             dims.append(self.joints_per_arm)

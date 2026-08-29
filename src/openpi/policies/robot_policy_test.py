@@ -213,6 +213,22 @@ def test_delta_mask_matches_the_hand_written_one():
     assert PIPER_H.delta_action_mask() == _transforms.make_bool_mask(6, -1, 6, -1)
 
 
+def test_trailing_grippers_move_the_absolute_dims_to_the_end():
+    # [arm0 joints, arm1 joints, arm0 gripper, arm1 gripper] -- the dual-Piper
+    # final_data layout. Same action_dim, different mask.
+    trailing = robot_policy.RobotSpec(
+        name="trailing", cameras=("cam", None, None), arms=2, joints_per_arm=6, grippers_trailing=True
+    )
+    assert trailing.action_dim == 14
+    assert trailing.delta_action_mask() == _transforms.make_bool_mask(12, -2)
+    # Without grippers, trailing and arm-major describe the same layout.
+    ng = robot_policy.RobotSpec(
+        name="ng", cameras=("cam", None, None), arms=2, joints_per_arm=6,
+        gripper_per_arm=False, grippers_trailing=True,
+    )
+    assert ng.delta_action_mask() == _transforms.make_bool_mask(12)
+
+
 def test_action_dim_is_derived_from_the_joint_layout():
     assert YAM.action_dim == 14
     single = robot_policy.RobotSpec(name="single", cameras=("cam", None, None), arms=1, joints_per_arm=6)

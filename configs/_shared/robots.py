@@ -192,3 +192,59 @@ PIPER_SINGLE = RobotSpec(
     # the 1.67 s that the same `action_horizon` buys on YAM or SO-101.
     control_hz=20.0,
 )
+
+
+# ---------------------------------------------------------------------------
+# Piper (dual arm) -- 14-DoF bimanual, 3 real cameras
+# ---------------------------------------------------------------------------
+# The THIRD Piper spec, and not a merge of the other two. `PIPER_H` is the old bimanual
+# rig whose camera keys lie about content (`front`/`right`/`top`, one dropped);
+# `PIPER_SINGLE` is the 7-D build with the dead arm removed at conversion. This is the
+# new dual-arm build where both arms are live and the three stored views are the three
+# the spec names -- YAM's occupancy pattern (all slots real, nothing padded, nothing
+# masked), on Piper's 20 Hz.
+#
+# Note the HYPHENS: `left-arm` / `right-arm`, matching the single-arm `right-arm`
+# convention (mrfood3's `r-arm` was normalised to it at conversion). A pool that stores
+# underscores instead fails loudly in the repack, which is the good outcome.
+#
+# Slot assignment is semantic here and genuinely corresponds: `top` is the workspace
+# view -> base_0_rgb, and each wrist camera goes to its own side's slot. That is more
+# than the identifiers require (see PIPER_H, where a right-arm camera correctly sits in
+# `left_wrist_0_rgb`) but there is no reason to be clever when the rig actually has the
+# geometry the keys describe.
+#
+# THE LAYOUT IS JOINTS-MAJOR, NOT ARM-MAJOR, and it is why `grippers_trailing` exists.
+# The `/workspace/final_data/` build stores
+#
+#     [right_j1-6, left_j1-6, right_gripper, left_gripper]
+#
+# on BOTH halves -- grippers at indices 12 and 13, not at 6 and 13. Read through the
+# default arm-major assumption, the delta mask would difference `right_gripper` as if
+# it were a joint and hold `left_j1` absolute, and nothing would raise. With the flag:
+#
+#     action_dim = 2 * (6 + 1)              = 14
+#     delta mask = make_bool_mask(12, -2)   = (12xT, F, F)
+#
+# The layout is also RIGHT-ARM-FIRST, which is fine -- the mask is symmetric across
+# arms either way. What is NOT enforceable from here is that every pool in a mixture
+# agrees on that order: an L-first pool and an R-first pool both pass every check
+# while disagreeing about which physical arm dims 0-5 drive. The final_data build
+# states one order for both halves; if a new pool joins, verify against content
+# (move one arm, watch which columns move), not metadata.
+#
+# 20 Hz as on every Piper build; a 50-step chunk is 2.5 s of future, NOT comparable to
+# the 1.67 s the same `action_horizon` buys on YAM even though both are 14-D bimanual.
+PIPER_DUAL = RobotSpec(
+    name="piper_dual",
+    cameras=(
+        "observation.images.top",  # -> base_0_rgb
+        "observation.images.left-arm",  # -> left_wrist_0_rgb
+        "observation.images.right-arm",  # -> right_wrist_0_rgb
+    ),
+    arms=2,
+    joints_per_arm=6,
+    gripper_per_arm=True,
+    grippers_trailing=True,  # [R j1-6, L j1-6, R grip, L grip] -- see above.
+    control_hz=20.0,
+)
