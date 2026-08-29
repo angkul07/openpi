@@ -35,10 +35,26 @@ only preflight_checks.py's source-classification report reads that identity).
 REVERSIBLE. The original gripper columns are dumped to a .npz sidecar before any
 write, and --revert restores them. A sentinel file blocks double-application.
 
+TWO LAYOUTS ARE SUPPORTED.
+
+  * TWO ROOTS (--teleop-root/--ego-root, the yam7h arms): ego and teleop are separate
+    LeRobot datasets, and every parquet under the ego root is rewritten.
+
+  * ONE MERGED ROOT (--merged-root, the pi05_50run_ea dataset): ego and teleop live in
+    the SAME root and are told apart by `meta/provenance.jsonl`, which build_50run.py
+    writes as {"episode_index", "source", ...}. Only the ego episodes are pooled as the
+    source distribution and only they are rewritten; the teleop episodes are the target
+    range and are never touched. The sentinel and backup still land in the merged root's
+    meta/, and they record which episodes were rewritten so --revert cannot drift.
+
 Usage (from the openpi repo root):
     uv run vast_run/pi05/rescale_ego_gripper.py                      # dry run, prints the plan
     uv run vast_run/pi05/rescale_ego_gripper.py --apply
     uv run vast_run/pi05/rescale_ego_gripper.py --revert
+
+    # merged single-root dataset (pi05_50run_ea):
+    uv run vast_run/pi05/rescale_ego_gripper.py --merged-root /workspace/50_run
+    uv run vast_run/pi05/rescale_ego_gripper.py --merged-root /workspace/50_run --apply
 
 After --apply the norm stats are stale and MUST be recomputed:
     rm -rf assets/pi05_yam7h_ea/yam7h_p50
@@ -75,9 +91,54 @@ def parquet_files(root: pathlib.Path) -> list[str]:
     return files
 
 
-def pool(root: pathlib.Path, n: int) -> dict[str, np.ndarray]:
+def episode_of(path: str) -> int:
+    """episode_000123.parquet -> 123."""
+    stem = pathlib.Path(path).stem
+    return int(stem.rsplit("_", 1)[1])
+
+
+def split_merged(root: pathlib.Path, ego_label: str, teleop_label: str) -> tuple[list[str], list[str]]:
+    """Split one merged root's parquet into (ego_files, teleop_files) via provenance.jsonl.
+
+    build_50run.py lays ego and teleop out as two contiguous episode blocks in a single
+    dataset, so the only record of which is which is meta/provenance.jsonl. Without it we
+    would be guessing, and rewriting a teleop episode as if it were ego is unrecoverable
+    short of --revert, so a missing/incomplete provenance is a hard error.
+    """
+    prov = root / "meta" / "provenance.jsonl"
+    if not prov.is_file():
+        raise SystemExit(f"--merged-root needs {prov} to tell ego from teleop; not found")
+    source_of: dict[int, str] = {}
+    with prov.open() as f:
+        for raw in f:
+            raw = raw.strip()
+            if not raw:
+                continue
+            rec = json.loads(raw)
+            source_of[int(rec["episode_index"])] = rec["source"]
+
+    labels = set(source_of.values())
+    for want in (ego_label, teleop_label):
+        if want not in labels:
+            raise SystemExit(f"provenance has sources {sorted(labels)}, no '{want}'")
+
+    ego, teleop = [], []
+    for path in parquet_files(root):
+        ep = episode_of(path)
+        if ep not in source_of:
+            raise SystemExit(f"episode {ep} ({path}) is absent from {prov}")
+        if source_of[ep] == ego_label:
+            ego.append(path)
+        elif source_of[ep] == teleop_label:
+            teleop.append(path)
+    if not ego or not teleop:
+        raise SystemExit(f"split produced ego={len(ego)} teleop={len(teleop)}; need both")
+    print(f"merged root split via provenance: ego={len(ego)} episodes, teleop={len(teleop)} episodes")
+    return ego, teleop
+
+
+def pool(files: list[str], n: int) -> dict[str, np.ndarray]:
     """Pool a spread of episodes into {column: (N,14)}."""
-    files = parquet_files(root)
     step = max(1, len(files) // n)
     acc: dict[str, list] = {c: [] for c in COLUMNS}
     for path in files[::step][:n]:
@@ -175,8 +236,7 @@ def rebuild_column(table: pa.Table, name: str, arr: np.ndarray) -> pa.Table:
     return table.set_column(idx, field, col)
 
 
-def apply(ego_root: pathlib.Path, plan: dict, lo_q: float, hi_q: float) -> None:
-    files = parquet_files(ego_root)
+def apply(ego_root: pathlib.Path, files: list[str], plan: dict, lo_q: float, hi_q: float) -> None:
     backup: dict[str, np.ndarray] = {}
     print(f"\nrewriting {len(files)} parquet files under {ego_root}/data ...")
     for i, path in enumerate(files):
@@ -213,23 +273,27 @@ def apply(ego_root: pathlib.Path, plan: dict, lo_q: float, hi_q: float) -> None:
     )
     print(f"backup -> {ego_root / BACKUP} ({(ego_root / BACKUP).stat().st_size / 1e6:.1f} MB)")
 
-    update_episode_stats(ego_root)
+    update_episode_stats(ego_root, files)
 
     (ego_root / SENTINEL).write_text(json.dumps({
         "applied": True, "anchors": [lo_q, hi_q], "gripper_dims": list(GRIPPER_DIMS),
         "plan": plan, "backup": BACKUP,
+        # Which episodes were rewritten. On a merged root this is the ONLY record that
+        # the teleop half was left alone, so --revert must read it back rather than
+        # re-deriving the split from provenance.
+        "rewritten_episodes": sorted(episode_of(p) for p in files),
     }, indent=2))
     print(f"sentinel -> {ego_root / SENTINEL}")
 
 
-def update_episode_stats(ego_root: pathlib.Path) -> None:
+def update_episode_stats(ego_root: pathlib.Path, files: list[str]) -> None:
     """Recompute min/max/mean/std for the gripper dims from the rewritten parquet."""
     stats_path = ego_root / "meta" / "episodes_stats.jsonl"
     if not stats_path.is_file():
         print("no episodes_stats.jsonl -- skipping stat refresh")
         return
     by_ep: dict[int, dict] = {}
-    for path in parquet_files(ego_root):
+    for path in files:
         t = pq.read_table(path, columns=[*COLUMNS, "episode_index"])
         ep = int(np.asarray(t["episode_index"].to_numpy(zero_copy_only=False))[0])
         by_ep[ep] = {c: np.stack(t[c].to_numpy(zero_copy_only=False)).astype(np.float64) for c in COLUMNS}
@@ -270,7 +334,11 @@ def revert(ego_root: pathlib.Path) -> None:
     keys = list(npz["keys"])
     offsets, data = npz["offsets"], npz["data"]
     index = {str(k): (int(offsets[i]), int(offsets[i + 1])) for i, k in enumerate(keys)}
-    files = parquet_files(ego_root)
+    # Revert exactly what apply() rewrote. Re-globbing the root would, on a merged
+    # dataset, also sweep in the teleop half -- which has no backup entry and would
+    # abort the revert halfway through, leaving the dataset in a mixed state.
+    rewritten = set(json.loads(sentinel.read_text()).get("rewritten_episodes", []))
+    files = [p for p in parquet_files(ego_root) if not rewritten or episode_of(p) in rewritten]
     print(f"reverting {len(files)} files ...")
     for path in files:
         rel = str(pathlib.Path(path).relative_to(ego_root))
@@ -298,6 +366,11 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--teleop-root", default=DEFAULT_TELEOP)
     ap.add_argument("--ego-root", default=DEFAULT_EGO)
+    ap.add_argument("--merged-root", default=None,
+                    help="single root holding BOTH sources; split by meta/provenance.jsonl "
+                         "(overrides --ego-root/--teleop-root)")
+    ap.add_argument("--ego-label", default="ego", help="provenance 'source' value for ego")
+    ap.add_argument("--teleop-label", default="teleop", help="provenance 'source' value for teleop")
     ap.add_argument("--episodes", type=int, default=150, help="episodes pooled per source to fit the map")
     ap.add_argument("--lo-q", type=float, default=1.0, help="lower anchor percentile")
     ap.add_argument("--hi-q", type=float, default=99.0, help="upper anchor percentile")
@@ -306,8 +379,13 @@ def main() -> None:
     ap.add_argument("--force", action="store_true", help="re-apply even if the sentinel exists")
     args = ap.parse_args()
 
-    ego_root = pathlib.Path(args.ego_root)
-    teleop_root = pathlib.Path(args.teleop_root)
+    if args.merged_root:
+        # One dataset, two sources: everything (sentinel, backup, stats) hangs off this
+        # root, and the ego/teleop distinction comes from provenance rather than layout.
+        ego_root = teleop_root = pathlib.Path(args.merged_root)
+    else:
+        ego_root = pathlib.Path(args.ego_root)
+        teleop_root = pathlib.Path(args.teleop_root)
 
     if args.revert:
         revert(ego_root)
@@ -320,16 +398,23 @@ def main() -> None:
             "Use --revert first, or --force if you really mean it."
         )
 
-    print(f"teleop : {teleop_root}\nego    : {ego_root}\npooling {args.episodes} episodes per source ...")
-    teleop = pool(teleop_root, args.episodes)
-    ego = pool(ego_root, args.episodes)
+    if args.merged_root:
+        print(f"merged : {ego_root}")
+        ego_files, teleop_files = split_merged(ego_root, args.ego_label, args.teleop_label)
+    else:
+        print(f"teleop : {teleop_root}\nego    : {ego_root}")
+        ego_files, teleop_files = parquet_files(ego_root), parquet_files(teleop_root)
+
+    print(f"pooling {args.episodes} episodes per source ...")
+    teleop = pool(teleop_files, args.episodes)
+    ego = pool(ego_files, args.episodes)
     plan = fit(teleop, ego, args.lo_q, args.hi_q)
     print_plan(plan, args.lo_q, args.hi_q)
 
     if not args.apply:
         print("\nDRY RUN -- nothing written. Re-run with --apply to commit.")
         return
-    apply(ego_root, plan, args.lo_q, args.hi_q)
+    apply(ego_root, ego_files, plan, args.lo_q, args.hi_q)
     print("\nDONE. Norm stats are now STALE -- recompute before training:")
     print("  rm -rf assets/pi05_yam7h_ea/yam7h_p50")
     print("  uv run scripts/compute_norm_stats.py --config-name pi05_yam7h_ea --max-frames 200000 --skip-videos")
